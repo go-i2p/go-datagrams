@@ -88,6 +88,39 @@ I2P supports multiple datagram types with different trade-offs:
 
 **Recommendation:** Use Raw datagrams for performance, Datagram3 for repliability with minimal overhead, or Datagram2 for authentication with replay protection.
 
+### Datagram3 Sender Identification
+
+Datagram3 provides repliability with minimal overhead, but the protocol only includes the sender's 32-byte hash, not the full destination. This means `ReceiveFrom()` returns an **empty** destination for Datagram3 messages.
+
+To identify the sender when using Datagram3:
+
+```go
+// Method 1: Check protocol and use appropriate receive method
+if conn.HasSenderDestination() {
+    // For Raw, Datagram1, Datagram2 - full destination available
+    payload, from, port, err := conn.ReceiveFrom()
+    // from.Base64() contains the full destination
+} else {
+    // For Datagram3 - only hash available
+    payload, addr, err := conn.ReceiveFromWithAddr()
+    if addr.IsHashOnly() {
+        // Look up full destination from cache or network database
+        hash := addr.DestinationHash // [32]byte hash
+        fullDest := myDestinationCache.Lookup(hash)
+    }
+}
+
+// Method 2: Always use ReceiveFromWithAddr() for flexibility
+payload, addr, err := conn.ReceiveFromWithAddr()
+if addr.HasFullDestination() {
+    // Full destination available
+    dest := addr.Destination
+} else if addr.HasDestinationHash() {
+    // Only hash available (Datagram3)
+    hash := addr.DestinationHash
+}
+```
+
 ### Size Limits
 
 - **Maximum I2CP datagram**: ~31KB (nominal 64KB minus overhead)

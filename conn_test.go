@@ -24,6 +24,7 @@ func (f fakeAddr) String() string  { return "fake:0" }
 type mockSession struct {
 	dest         *i2cp.Destination
 	closed       bool
+	offline      bool // Simulates session with offline keys (LS2)
 	lastProtocol uint8
 	lastSrcPort  uint16
 	lastDestPort uint16
@@ -37,6 +38,10 @@ func (m *mockSession) Destination() *i2cp.Destination {
 
 func (m *mockSession) IsClosed() bool {
 	return m.closed
+}
+
+func (m *mockSession) IsOffline() bool {
+	return m.offline
 }
 
 func (m *mockSession) SendMessage(destination *i2cp.Destination, protocol uint8, srcPort, destPort uint16, payload *i2cp.Stream, nonce uint32) error {
@@ -62,7 +67,12 @@ func (m *mockSession) SendMessageWithContext(ctx context.Context, destination *i
 }
 
 func (m *mockSession) SigningKeyPair() (*i2cp.Ed25519KeyPair, error) {
-	// Return a generated key pair for signing
+	// Return the key pair from the destination for signature verification to work
+	// The signing key must match the public key embedded in the destination
+	if m.dest != nil {
+		return m.dest.SigningKeyPair()
+	}
+	// Fallback for tests without a destination
 	crypto := i2cp.NewCrypto()
 	return crypto.Ed25519SignatureKeygen()
 }
@@ -209,6 +219,38 @@ func TestNewDatagramConnWithProtocol_StreamingRejected(t *testing.T) {
 	// Verify error message mentions protocol 6 and streaming
 	if !strings.Contains(err.Error(), "6") || !strings.Contains(err.Error(), "streaming") {
 		t.Errorf("error message should mention protocol 6 and streaming, got: %v", err)
+	}
+}
+
+// TestDatagramConn_HasSenderDestination verifies the HasSenderDestination() helper method.
+// This method returns true for all protocols except Datagram3, which only provides
+// the sender's hash, not the full destination.
+func TestDatagramConn_HasSenderDestination(t *testing.T) {
+	testCases := []struct {
+		name     string
+		protocol uint8
+		expected bool
+	}{
+		{"Raw", ProtocolRaw, true},
+		{"Datagram1", ProtocolDatagram1, true},
+		{"Datagram2", ProtocolDatagram2, true},
+		{"Datagram3", ProtocolDatagram3, false}, // Only provides hash, not full destination
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			session := newMockSession()
+			conn, err := NewDatagramConnWithProtocol(session, 8080, tc.protocol)
+			if err != nil {
+				t.Fatalf("NewDatagramConnWithProtocol() failed: %v", err)
+			}
+			defer conn.Close()
+
+			got := conn.HasSenderDestination()
+			if got != tc.expected {
+				t.Errorf("HasSenderDestination() = %v, want %v", got, tc.expected)
+			}
+		})
 	}
 }
 
@@ -681,6 +723,33 @@ func TestSendTo_Datagram1(t *testing.T) {
 	}
 }
 
+// TestSendTo_Datagram1_OfflineKeysRejected tests that Datagram1 rejects sessions with offline keys.
+// Per I2P specification, Datagram1 does NOT support offline signatures (LS2 offline keys).
+func TestSendTo_Datagram1_OfflineKeysRejected(t *testing.T) {
+	session := newMockSession()
+	session.offline = true // Simulate session with offline keys
+
+	conn, err := NewDatagramConnWithProtocol(session, 8080, ProtocolDatagram1)
+	if err != nil {
+		t.Fatalf("NewDatagramConnWithProtocol() failed: %v", err)
+	}
+	defer conn.Close()
+
+	// Try to send - should fail because session has offline keys
+	err = conn.SendTo([]byte("test"), validDestinationB64(), 9090)
+	if err == nil {
+		t.Error("SendTo() with Datagram1 and offline keys should return error")
+	}
+
+	// Verify error message mentions offline signatures and Datagram2
+	if err != nil && !strings.Contains(err.Error(), "offline") {
+		t.Errorf("error should mention offline signatures: %v", err)
+	}
+	if err != nil && !strings.Contains(err.Error(), "Datagram2") {
+		t.Errorf("error should suggest using Datagram2: %v", err)
+	}
+}
+
 // TestSendTo_Datagram2 tests that Datagram2 sends correctly with envelope and signature.
 func TestSendTo_Datagram2(t *testing.T) {
 	session := newMockSession()
@@ -719,9 +788,9 @@ func TestMaxPayloadSize(t *testing.T) {
 		want     int
 	}{
 		{"Raw", ProtocolRaw, MaxI2NPSize},
-		{"Datagram3", ProtocolDatagram3, MaxI2NPSize - Datagram3Overhead},
-		{"Datagram1", ProtocolDatagram1, MaxI2NPSize - Datagram1Overhead},
-		{"Datagram2", ProtocolDatagram2, MaxI2NPSize - Datagram2Overhead},
+		{"Datagram3", ProtocolDatagram3, MaxI2NPSize - MinDatagram3Overhead},
+		{"Datagram1", ProtocolDatagram1, MaxI2NPSize - MinDatagram1Overhead},
+		{"Datagram2", ProtocolDatagram2, MaxI2NPSize - MinDatagram2Overhead},
 	}
 
 	for _, tt := range tests {
@@ -1083,6 +1152,452 @@ func TestReceiveFrom_Datagram2InvalidSignature(t *testing.T) {
 
 	if err != nil && !strings.Contains(err.Error(), "signature") {
 		t.Errorf("unexpected error message (should mention signature): %v", err)
+	}
+}
+
+// =============================================================================
+// Round-Trip Tests: Build → Parse → Compare
+// =============================================================================
+// These tests verify that the build*Envelope and parse*Envelope functions
+// correctly round-trip, ensuring that what is built can be parsed and produces
+// identical results. Per AUDIT.md Test Verification Recommendations item 2.
+
+// TestDatagram1Envelope_Roundtrip tests that building then parsing a Datagram1
+// envelope produces the same payload and correct sender destination.
+func TestDatagram1Envelope_Roundtrip(t *testing.T) {
+	session := newMockSession()
+
+	testCases := []struct {
+		name    string
+		payload []byte
+	}{
+		{"empty payload", []byte{}},
+		{"small payload", []byte("hello")},
+		{"medium payload", []byte("The quick brown fox jumps over the lazy dog")},
+		{"binary payload", []byte{0x00, 0x01, 0x02, 0xFF, 0xFE, 0xFD}},
+		{"unicode payload", []byte("Hello 世界 🌍")},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Build the envelope
+			envelope, err := buildDatagram1Envelope(tc.payload, session)
+			if err != nil {
+				t.Fatalf("buildDatagram1Envelope() failed: %v", err)
+			}
+
+			// Verify minimum envelope size
+			if len(envelope) < MinDatagram1Overhead {
+				t.Errorf("envelope size = %d, want at least %d", len(envelope), MinDatagram1Overhead)
+			}
+
+			// Parse the envelope
+			parsedPayload, parsedFrom, err := parseDatagram1Envelope(envelope, session)
+			if err != nil {
+				t.Fatalf("parseDatagram1Envelope() failed: %v", err)
+			}
+
+			// Verify payload matches
+			if string(parsedPayload) != string(tc.payload) {
+				t.Errorf("payload mismatch: got %q, want %q", parsedPayload, tc.payload)
+			}
+
+			// Verify sender destination matches session destination
+			expectedDest := session.Destination().Base64()
+			if parsedFrom.Base64() != expectedDest {
+				t.Error("sender destination mismatch")
+			}
+		})
+	}
+}
+
+// TestDatagram2Envelope_Roundtrip tests that building then parsing a Datagram2
+// envelope produces the same payload and correct sender destination.
+func TestDatagram2Envelope_Roundtrip(t *testing.T) {
+	session := newMockSession()
+
+	// Compute target destination hash from session's own destination (self-send scenario)
+	localDest := session.Destination()
+	destStream := i2cp.NewStream(nil)
+	if err := localDest.WriteToMessage(destStream); err != nil {
+		t.Fatalf("WriteToMessage() failed: %v", err)
+	}
+	targetHash := sha256.Sum256(destStream.Bytes())
+
+	testCases := []struct {
+		name    string
+		payload []byte
+	}{
+		{"empty payload", []byte{}},
+		{"small payload", []byte("hello")},
+		{"medium payload", []byte("The quick brown fox jumps over the lazy dog")},
+		{"binary payload", []byte{0x00, 0x01, 0x02, 0xFF, 0xFE, 0xFD}},
+		{"unicode payload", []byte("Hello 世界 🌍")},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Build the envelope
+			envelope, err := buildDatagram2Envelope(tc.payload, session, targetHash)
+			if err != nil {
+				t.Fatalf("buildDatagram2Envelope() failed: %v", err)
+			}
+
+			// Verify minimum envelope size
+			if len(envelope) < MinDatagram2Overhead {
+				t.Errorf("envelope size = %d, want at least %d", len(envelope), MinDatagram2Overhead)
+			}
+
+			// Parse the envelope (session is both sender and receiver in this test)
+			parsedPayload, parsedFrom, err := parseDatagram2Envelope(envelope, session)
+			if err != nil {
+				t.Fatalf("parseDatagram2Envelope() failed: %v", err)
+			}
+
+			// Verify payload matches
+			if string(parsedPayload) != string(tc.payload) {
+				t.Errorf("payload mismatch: got %q, want %q", parsedPayload, tc.payload)
+			}
+
+			// Verify sender destination matches session destination
+			expectedDest := session.Destination().Base64()
+			if parsedFrom.Base64() != expectedDest {
+				t.Error("sender destination mismatch")
+			}
+		})
+	}
+}
+
+// TestDatagram2Envelope_RoundtripWithOptions tests Datagram2 with options field.
+func TestDatagram2Envelope_RoundtripWithOptions(t *testing.T) {
+	session := newMockSession()
+
+	// Compute target destination hash
+	localDest := session.Destination()
+	destStream := i2cp.NewStream(nil)
+	if err := localDest.WriteToMessage(destStream); err != nil {
+		t.Fatalf("WriteToMessage() failed: %v", err)
+	}
+	targetHash := sha256.Sum256(destStream.Bytes())
+
+	// Create options
+	options := NewOptions(map[string]string{
+		"from.port": "8080",
+		"to.port":   "9090",
+	})
+
+	payload := []byte("test with options")
+
+	// Build the envelope with options
+	envelope, err := buildDatagram2EnvelopeWithOptions(payload, session, targetHash, options)
+	if err != nil {
+		t.Fatalf("buildDatagram2EnvelopeWithOptions() failed: %v", err)
+	}
+
+	// Parse the envelope
+	parsedPayload, parsedFrom, err := parseDatagram2Envelope(envelope, session)
+	if err != nil {
+		t.Fatalf("parseDatagram2Envelope() failed: %v", err)
+	}
+
+	// Verify payload matches
+	if string(parsedPayload) != string(payload) {
+		t.Errorf("payload mismatch: got %q, want %q", parsedPayload, payload)
+	}
+
+	// Verify sender destination
+	expectedDest := session.Destination().Base64()
+	if parsedFrom.Base64() != expectedDest {
+		t.Error("sender destination mismatch")
+	}
+}
+
+// TestDatagram2Envelope_ReplayPrevention tests that Datagram2 rejects replayed datagrams
+// sent to a different destination (wrong target hash).
+func TestDatagram2Envelope_ReplayPrevention(t *testing.T) {
+	session := newMockSession()
+
+	// Create a different target destination (simulating sending to someone else)
+	crypto := i2cp.NewCrypto()
+	otherDest, _ := i2cp.NewDestination(crypto)
+	otherStream := i2cp.NewStream(nil)
+	if err := otherDest.WriteToMessage(otherStream); err != nil {
+		t.Fatalf("WriteToMessage() failed: %v", err)
+	}
+	otherHash := sha256.Sum256(otherStream.Bytes())
+
+	payload := []byte("replay test")
+
+	// Build envelope for OTHER destination
+	envelope, err := buildDatagram2Envelope(payload, session, otherHash)
+	if err != nil {
+		t.Fatalf("buildDatagram2Envelope() failed: %v", err)
+	}
+
+	// Try to parse as if WE received it (our hash doesn't match)
+	_, _, err = parseDatagram2Envelope(envelope, session)
+	if err == nil {
+		t.Error("parseDatagram2Envelope() should fail for wrong target destination (replay prevention)")
+	}
+
+	if err != nil && !strings.Contains(err.Error(), "signature verification failed") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+// TestDatagram2Envelope_ReservedFlagBits tests that Datagram2 parsing rejects
+// envelopes with non-zero reserved flag bits (bits 6-15).
+// Per spec: "Bits 15-6: unused, set to 0 for compatibility with future uses"
+func TestDatagram2Envelope_ReservedFlagBits(t *testing.T) {
+	session := newMockSession()
+
+	// Compute target destination hash from session's own destination
+	localDest := session.Destination()
+	destStream := i2cp.NewStream(nil)
+	if err := localDest.WriteToMessage(destStream); err != nil {
+		t.Fatalf("WriteToMessage() failed: %v", err)
+	}
+	targetHash := sha256.Sum256(destStream.Bytes())
+
+	// Build a valid Datagram2 envelope first
+	payload := []byte("test payload")
+	envelope, err := buildDatagram2Envelope(payload, session, targetHash)
+	if err != nil {
+		t.Fatalf("buildDatagram2Envelope() failed: %v", err)
+	}
+
+	// Find flags position (after destination)
+	destLen := destStream.Len()
+
+	testCases := []struct {
+		name     string
+		highByte byte // flags[0] - bits 8-15
+		lowByte  byte // flags[1] - bits 0-7, only bits 0-5 are used
+	}{
+		{"bit 6 set", 0x00, 0x42},              // 0x02 version with bit 6 set
+		{"bit 7 set", 0x00, 0x82},              // 0x02 version with bit 7 set
+		{"bit 8 set", 0x01, 0x02},              // bit 8 (high byte bit 0)
+		{"bit 15 set", 0x80, 0x02},             // bit 15 (high byte bit 7)
+		{"multiple reserved bits", 0xFF, 0xC2}, // many reserved bits set
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Create a copy of the envelope
+			testEnvelope := make([]byte, len(envelope))
+			copy(testEnvelope, envelope)
+
+			// Modify the flags to set reserved bits
+			testEnvelope[destLen] = tc.highByte
+			testEnvelope[destLen+1] = tc.lowByte
+
+			// Attempt to parse - should fail due to reserved bits
+			_, _, err := parseDatagram2Envelope(testEnvelope, session)
+			if err == nil {
+				t.Error("parseDatagram2Envelope() should fail for non-zero reserved bits")
+			}
+			if err != nil && !strings.Contains(err.Error(), "reserved flag bits") {
+				t.Errorf("unexpected error message: %v (expected 'reserved flag bits')", err)
+			}
+		})
+	}
+
+	// Verify that valid envelope still parses successfully
+	t.Run("valid flags", func(t *testing.T) {
+		_, _, err := parseDatagram2Envelope(envelope, session)
+		if err != nil {
+			t.Errorf("parseDatagram2Envelope() failed for valid envelope: %v", err)
+		}
+	})
+}
+
+// TestDatagram3Envelope_ReservedFlagBits tests that Datagram3 parsing rejects
+// envelopes with non-zero reserved flag bits (bits 5-15).
+// Per spec: "Bits 15-5: unused, set to 0 for compatibility with future uses"
+func TestDatagram3Envelope_ReservedFlagBits(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConnWithProtocol(session, 8080, ProtocolDatagram3)
+	if err != nil {
+		t.Fatalf("NewDatagramConnWithProtocol() failed: %v", err)
+	}
+	defer conn.Close()
+
+	// Send a valid Datagram3 to get a properly formatted envelope
+	destStr := validDestinationB64()
+	payload := []byte("reserved bits test")
+	err = conn.SendTo(payload, destStr, 9090)
+	if err != nil {
+		t.Fatalf("SendTo() failed: %v", err)
+	}
+	validEnvelope := session.lastPayload
+
+	testCases := []struct {
+		name     string
+		highByte byte // flags[0] - bits 8-15 (all reserved)
+		lowByte  byte // flags[1] - bits 5-7 reserved, bits 0-4 used
+	}{
+		{"bit 5 set", 0x00, 0x23},              // 0x03 version with bit 5 set
+		{"bit 6 set", 0x00, 0x43},              // 0x03 version with bit 6 set
+		{"bit 7 set", 0x00, 0x83},              // 0x03 version with bit 7 set
+		{"bit 8 set", 0x01, 0x03},              // bit 8 (high byte bit 0)
+		{"bit 15 set", 0x80, 0x03},             // bit 15 (high byte bit 7)
+		{"multiple reserved bits", 0xFF, 0xE3}, // many reserved bits set
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Create a copy of the envelope
+			testEnvelope := make([]byte, len(validEnvelope))
+			copy(testEnvelope, validEnvelope)
+
+			// Modify the flags to set reserved bits (flags are at offset 32-33)
+			testEnvelope[32] = tc.highByte
+			testEnvelope[33] = tc.lowByte
+
+			// Simulate receiving this datagram
+			receivedDg := &receivedDatagram{
+				payload:  testEnvelope,
+				from:     &i2cp.Destination{},
+				protocol: ProtocolDatagram3,
+			}
+
+			// Attempt to parse - should fail due to reserved bits
+			_, _, _, err := conn.parseEnvelope(receivedDg, ProtocolDatagram3)
+			if err == nil {
+				t.Error("parseEnvelope() should fail for non-zero reserved bits")
+			}
+			if err != nil && !strings.Contains(err.Error(), "reserved flag bits") {
+				t.Errorf("unexpected error message: %v (expected 'reserved flag bits')", err)
+			}
+		})
+	}
+
+	// Verify that valid envelope still parses successfully
+	t.Run("valid flags", func(t *testing.T) {
+		receivedDg := &receivedDatagram{
+			payload:  validEnvelope,
+			from:     &i2cp.Destination{},
+			protocol: ProtocolDatagram3,
+		}
+		_, _, _, err := conn.parseEnvelope(receivedDg, ProtocolDatagram3)
+		if err != nil {
+			t.Errorf("parseEnvelope() failed for valid envelope: %v", err)
+		}
+	})
+}
+
+// TestDatagram3Envelope_Roundtrip tests Datagram3 envelope build and parse.
+// Note: Datagram3 doesn't have build/parse functions as it's simpler,
+// but we test the receive path to verify the format is correct.
+func TestDatagram3Envelope_Roundtrip(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConnWithProtocol(session, 8080, ProtocolDatagram3)
+	if err != nil {
+		t.Fatalf("NewDatagramConnWithProtocol() failed: %v", err)
+	}
+	defer conn.Close()
+
+	// Send a Datagram3 to capture the envelope
+	destStr := validDestinationB64()
+	payload := []byte("datagram3 roundtrip test")
+
+	err = conn.SendTo(payload, destStr, 9090)
+	if err != nil {
+		t.Fatalf("SendTo() failed: %v", err)
+	}
+
+	// Get the envelope that was sent
+	sentEnvelope := session.lastPayload
+
+	// Verify envelope structure: fromhash(32) + flags(2) + payload
+	expectedSize := 32 + 2 + len(payload)
+	if len(sentEnvelope) != expectedSize {
+		t.Errorf("envelope size = %d, want %d", len(sentEnvelope), expectedSize)
+	}
+
+	// Verify flags: high byte 0x00, low byte 0x03 (version)
+	if sentEnvelope[32] != 0x00 || sentEnvelope[33] != 0x03 {
+		t.Errorf("flags = [%02x %02x], want [00 03]", sentEnvelope[32], sentEnvelope[33])
+	}
+
+	// Extract payload from envelope
+	extractedPayload := sentEnvelope[34:]
+	if string(extractedPayload) != string(payload) {
+		t.Errorf("payload mismatch: got %q, want %q", extractedPayload, payload)
+	}
+
+	// Verify hash is correct (matches our local destination)
+	localDest := session.Destination()
+	localStream := i2cp.NewStream(nil)
+	localDest.WriteToStream(localStream)
+	expectedHash := sha256.Sum256(localStream.Bytes())
+
+	var gotHash [32]byte
+	copy(gotHash[:], sentEnvelope[0:32])
+
+	if gotHash != expectedHash {
+		t.Errorf("hash mismatch: got %x, want %x", gotHash, expectedHash)
+	}
+}
+
+// TestEnvelope_MaxPayloadSize tests that envelopes respect size limits.
+func TestEnvelope_MaxPayloadSize(t *testing.T) {
+	session := newMockSession()
+
+	testCases := []struct {
+		name          string
+		protocol      uint8
+		maxPayload    int
+		overhead      int
+		buildEnvelope func(payload []byte) ([]byte, error)
+	}{
+		{
+			name:       "Datagram1",
+			protocol:   ProtocolDatagram1,
+			maxPayload: MaxI2NPSize - MinDatagram1Overhead,
+			overhead:   MinDatagram1Overhead,
+			buildEnvelope: func(payload []byte) ([]byte, error) {
+				return buildDatagram1Envelope(payload, session)
+			},
+		},
+		{
+			name:       "Datagram2",
+			protocol:   ProtocolDatagram2,
+			maxPayload: MaxI2NPSize - MinDatagram2Overhead,
+			overhead:   MinDatagram2Overhead,
+			buildEnvelope: func(payload []byte) ([]byte, error) {
+				localDest := session.Destination()
+				destStream := i2cp.NewStream(nil)
+				if err := localDest.WriteToMessage(destStream); err != nil {
+					return nil, err
+				}
+				targetHash := sha256.Sum256(destStream.Bytes())
+				return buildDatagram2Envelope(payload, session, targetHash)
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Create maximum size payload
+			maxPayload := make([]byte, tc.maxPayload)
+			for i := range maxPayload {
+				maxPayload[i] = byte(i % 256)
+			}
+
+			// Build envelope with max payload
+			envelope, err := tc.buildEnvelope(maxPayload)
+			if err != nil {
+				t.Fatalf("buildEnvelope() with max payload failed: %v", err)
+			}
+
+			// Verify envelope size is exactly max I2NP size
+			expectedEnvSize := MaxI2NPSize
+			if len(envelope) != expectedEnvSize {
+				t.Errorf("envelope size = %d, want %d (payload %d + overhead %d)",
+					len(envelope), expectedEnvSize, tc.maxPayload, tc.overhead)
+			}
+		})
 	}
 }
 

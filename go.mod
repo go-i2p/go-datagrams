@@ -4,7 +4,7 @@ go 1.24.4
 
 require (
 	github.com/go-i2p/common v0.1.0
-	github.com/go-i2p/go-i2cp v0.0.0-20260115033312-c55a621f11ed
+	github.com/go-i2p/go-i2cp v0.1.0
 )
 
 require (
@@ -14,7 +14,7 @@ require (
 	github.com/go-i2p/logger v0.1.0 // indirect
 	github.com/oklog/ulid/v2 v2.1.1 // indirect
 	github.com/samber/lo v1.52.0 // indirect
-	github.com/samber/oops v1.20.0 // indirect
+	github.com/samber/oops v1.21.0 // indirect
 	github.com/sirupsen/logrus v1.9.4 // indirect
 	go.opentelemetry.io/otel v1.39.0 // indirect
 	go.opentelemetry.io/otel/trace v1.39.0 // indirect

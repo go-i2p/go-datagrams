@@ -120,6 +120,10 @@ func (m *mockSession) IsClosed() bool {
 	return m.closed
 }
 
+func (m *mockSession) IsOffline() bool {
+	return false // Standard online keys for this example
+}
+
 func (m *mockSession) SendMessage(dest *i2cp.Destination, protocol uint8, srcPort, destPort uint16, payload *i2cp.Stream, nonce uint32) error {
 	// In a real session, this would send via I2CP protocol
 	time.Sleep(10 * time.Millisecond) // Simulate network delay

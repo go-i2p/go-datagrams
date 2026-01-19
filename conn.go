@@ -24,6 +24,11 @@ type I2CPSession interface {
 	// IsClosed returns true if the session has been closed.
 	IsClosed() bool
 
+	// IsOffline returns true if this session uses offline keys (LS2).
+	// Sessions with offline keys should use Datagram2 instead of Datagram1.
+	// Per I2P specification, Datagram1 does NOT support offline signatures.
+	IsOffline() bool
+
 	// SendMessage sends a datagram message to the specified destination.
 	// This will be used by the SendTo implementation.
 	SendMessage(destination *i2cp.Destination, protocol uint8, srcPort, destPort uint16, payload *i2cp.Stream, nonce uint32) error
@@ -40,33 +45,33 @@ type I2CPSession interface {
 // Verify that *i2cp.Session implements I2CPSession at compile time.
 var _ I2CPSession = (*i2cp.Session)(nil)
 
-// Protocol numbers for I2P datagram types as defined in the I2P specification.
+// Protocol numbers for I2P datagram types.
+// These are aliases to the constants defined in go-i2cp for convenience.
 // See SPEC.md for detailed format specifications.
 const (
 	// ProtocolStreaming (6) is reserved for I2P streaming protocol.
 	// This protocol number MUST NOT be used for datagrams.
-	// Per I2P specification: "any other protocol numbers may be used other
-	// than the streaming protocol number (6)".
-	ProtocolStreaming uint8 = 6
+	ProtocolStreaming = i2cp.ProtoStreaming
 
 	// ProtocolRaw (18) is for non-repliable, non-authenticated datagrams.
 	// Zero overhead, highest performance. Use for trusted peers or when
 	// authentication is handled at the application layer.
-	ProtocolRaw uint8 = 18
+	ProtocolRaw = i2cp.ProtoDatagramRaw
 
 	// ProtocolDatagram1 (17) is for repliable, authenticated datagrams (legacy).
-	// ~427 bytes overhead. Use for compatibility with older I2P applications.
-	ProtocolDatagram1 uint8 = 17
+	// ~455 bytes overhead (Ed25519). Use for compatibility with older I2P applications.
+	// WARNING: Does NOT support offline signatures (LS2 offline keys).
+	ProtocolDatagram1 = i2cp.ProtoDatagram
 
 	// ProtocolDatagram2 (19) is for repliable, authenticated datagrams with replay prevention.
-	// ~433+ bytes overhead. Use for modern authenticated messaging requiring
-	// protection against replay attacks.
-	ProtocolDatagram2 uint8 = 19
+	// ~457+ bytes overhead (Ed25519). Use for modern authenticated messaging requiring
+	// protection against replay attacks. Supports offline signatures.
+	ProtocolDatagram2 = i2cp.ProtoDatagram2
 
 	// ProtocolDatagram3 (20) is for repliable, non-authenticated datagrams.
 	// ~34 bytes overhead. Use when repliability is needed with minimal overhead
 	// and authentication is not required.
-	ProtocolDatagram3 uint8 = 20
+	ProtocolDatagram3 = i2cp.ProtoDatagram3
 )
 
 // Size constants for I2P datagrams.
@@ -91,20 +96,33 @@ const (
 
 	// Ed25519DestinationSize is the wire format size for an Ed25519 destination.
 	// Wire format: pubKey(256) + signingPubKey(128) + certificate(7) = 391 bytes
-	// Note: The I2P spec says "387+" for serialized format, but wire format is 391+.
+	//
+	// Note: The I2P spec says "387+" for serialized format because DSA-SHA1 destinations
+	// fit in 387 bytes. Ed25519 with KEY certificates requires 391 bytes due to the
+	// certificate structure. This value is constant for go-i2cp's Ed25519-only destinations.
 	Ed25519DestinationSize = 391
 
-	// Datagram1Overhead is the envelope overhead for Datagram1 with Ed25519.
+	// MinDatagram1Overhead is the minimum envelope overhead for Datagram1 with Ed25519.
 	// destination(391) + signature(64) = 455 bytes
-	Datagram1Overhead = Ed25519DestinationSize + Ed25519SignatureLength // 455
+	//
+	// This is the minimum because the destination size can vary with certificate type.
+	// For go-i2cp's Ed25519-only destinations, this is also the exact overhead.
+	MinDatagram1Overhead = Ed25519DestinationSize + Ed25519SignatureLength // 455
 
-	// Datagram2Overhead is the minimum envelope overhead for Datagram2 with Ed25519.
-	// destination(391) + flags(2) + signature(64) = 457 bytes (without options)
-	Datagram2Overhead = Ed25519DestinationSize + 2 + Ed25519SignatureLength // 457
+	// MinDatagram2Overhead is the minimum envelope overhead for Datagram2 with Ed25519.
+	// destination(391) + flags(2) + signature(64) = 457 bytes (without options or offline sig)
+	//
+	// Actual overhead may be larger when:
+	// - Options field is present (adds 2+ bytes for mapping)
+	// - Offline signature is present (adds ~102 bytes for Ed25519)
+	MinDatagram2Overhead = Ed25519DestinationSize + 2 + Ed25519SignatureLength // 457
 
-	// Datagram3Overhead is the envelope overhead for Datagram3.
-	// fromhash(32) + flags(2) = 34 bytes
-	Datagram3Overhead = 32 + 2 // 34
+	// MinDatagram3Overhead is the minimum envelope overhead for Datagram3.
+	// fromhash(32) + flags(2) = 34 bytes (without options)
+	//
+	// Actual overhead may be larger when:
+	// - Options field is present (adds 2+ bytes for mapping)
+	MinDatagram3Overhead = 32 + 2 // 34
 )
 
 // DatagramConn represents a stateless I2P datagram connection that wraps an I2CP session.
@@ -405,6 +423,27 @@ func (d *DatagramConn) Protocol() uint8 {
 	return d.protocol
 }
 
+// HasSenderDestination returns true if ReceiveFrom() will return a usable sender destination.
+//
+// For Datagram3 (protocol 20), this returns false because the protocol only includes
+// the sender's 32-byte hash, not the full destination. In this case, applications should
+// use ReceiveFromWithAddr() instead to get the sender's hash via I2PAddr.DestinationHash.
+//
+// For all other protocols (Raw, Datagram1, Datagram2), this returns true.
+//
+// Example usage:
+//
+//	if conn.HasSenderDestination() {
+//	    payload, from, port, err := conn.ReceiveFrom()
+//	    // from is a valid destination
+//	} else {
+//	    payload, addr, err := conn.ReceiveFromWithAddr()
+//	    // Use addr.DestinationHash to identify the sender
+//	}
+func (d *DatagramConn) HasSenderDestination() bool {
+	return d.protocol != ProtocolDatagram3
+}
+
 // Session returns the underlying I2CP session.
 // This allows advanced users to access session-level operations if needed.
 func (d *DatagramConn) Session() I2CPSession {
@@ -433,11 +472,11 @@ func (d *DatagramConn) MaxPayloadSize() int {
 	case ProtocolRaw:
 		return MaxI2NPSize // No overhead for raw datagrams
 	case ProtocolDatagram3:
-		return MaxI2NPSize - Datagram3Overhead // fromhash(32) + flags(2) = 34
+		return MaxI2NPSize - MinDatagram3Overhead // fromhash(32) + flags(2) = 34
 	case ProtocolDatagram1:
-		return MaxI2NPSize - Datagram1Overhead // dest(391) + signature(64) = 455
+		return MaxI2NPSize - MinDatagram1Overhead // dest(391) + signature(64) = 455
 	case ProtocolDatagram2:
-		return MaxI2NPSize - Datagram2Overhead // dest(391) + flags(2) + signature(64) = 457
+		return MaxI2NPSize - MinDatagram2Overhead // dest(391) + flags(2) + signature(64) = 457
 	default:
 		return MaxI2NPSize // Conservative fallback
 	}
@@ -581,12 +620,23 @@ func (d *DatagramConn) SendTo(payload []byte, destinationB64 string, port uint16
 //
 // The method parses protocol-specific envelopes:
 //   - Raw (18): Payload is returned directly (no envelope)
-//   - Datagram3 (20): Extracts fromhash(32) + flags(2), then payload
 //   - Datagram1 (17): Extracts from destination + signature, verifies signature, then payload
 //   - Datagram2 (19): Extracts from + flags + signature, verifies with replay prevention, then payload
+//   - Datagram3 (20): Extracts fromhash(32) + flags(2), then payload (see WARNING below)
 //
-// Note: For Datagram3, the sender destination returned is empty because the protocol only
-// includes a hash, not the full destination. Use ReceiveFromWithAddr() to get the hash.
+// # WARNING: Datagram3 Sender Identification
+//
+// For Datagram3 (protocol 20), the returned sender destination is EMPTY because the
+// protocol only includes a 32-byte hash of the sender's destination, not the full
+// destination itself. If you need to identify the sender when using Datagram3:
+//
+//  1. Use [DatagramConn.ReceiveFromWithAddr] instead - it returns an [I2PAddr] containing
+//     the sender's hash in DestinationHash field
+//  2. Use [DatagramConn.HasSenderDestination] to check if this method will return a valid
+//     destination before calling
+//
+// To reply to a Datagram3 sender, applications must look up the full destination from
+// a cache or the I2P network database using the hash.
 //
 // Returns an error if:
 //   - The connection is closed
@@ -704,11 +754,21 @@ func (d *DatagramConn) parseEnvelope(msg *receivedDatagram, protocol uint8) ([]b
 
 		// Extract flags per I2P Datagram specification:
 		// Per spec: "flags :: (2 bytes) Bit order: 15 14 ... 3 2 1 0"
-		// - High byte (index 32): reserved, currently unused
-		// - Low byte (index 33): contains version (bits 0-3) and options flag (bit 4)
+		// - High byte (index 32): reserved, currently unused (bits 8-15)
+		// - Low byte (index 33): contains version (bits 0-3), options flag (bit 4), bits 5-7 reserved
 		// See: https://geti2p.net/spec/datagrams#datagram3
-		// highFlags := msg.payload[32] // reserved per spec
+		highFlags := msg.payload[32]
 		lowFlags := msg.payload[33]
+
+		// Validate reserved bits (5-15) are zero per spec:
+		// "Bits 15-5: unused, set to 0 for compatibility with future uses"
+		// High byte is entirely reserved; low byte bits 5-7 are reserved.
+		reservedMask := uint16(0xFFE0) // bits 5-15
+		flagsValue := uint16(highFlags)<<8 | uint16(lowFlags)
+		if flagsValue&reservedMask != 0 {
+			return nil, nil, 0, fmt.Errorf("Datagram3 has non-zero reserved flag bits: 0x%04x (reserved bits: 0x%04x)", flagsValue, flagsValue&reservedMask)
+		}
+
 		version := lowFlags & 0x0F
 		hasOptions := (lowFlags & 0x10) != 0
 
@@ -907,12 +967,13 @@ func (d *DatagramConn) parseEnvelopeToAddr(msg *receivedDatagram, protocol uint8
 //
 // Returns the complete envelope or an error if signing fails.
 func buildDatagram1Envelope(payload []byte, session I2CPSession) ([]byte, error) {
-	// NOTE: Per spec, Datagram1 does NOT support offline signatures.
+	// Per I2P specification, Datagram1 does NOT support offline signatures (LS2 offline keys).
 	// The Java reference implementation (I2PDatagramMaker) throws IllegalArgumentException
-	// if session.isOffline() returns true. However, go-i2cp currently doesn't expose
-	// an IsOffline() method on Session, so we cannot perform this check.
-	// TODO: Add IsOffline() check when go-i2cp exposes this method.
-	// For now, users with offline keys should use Datagram2 (protocol 19).
+	// if session.isOffline() returns true. We replicate this behavior here.
+	// See: https://geti2p.net/spec/datagrams#notes
+	if session.IsOffline() {
+		return nil, fmt.Errorf("Datagram1 does not support offline signatures (LS2 offline keys); use Datagram2 (protocol %d) instead", ProtocolDatagram2)
+	}
 
 	// Get the session's signing key pair
 	keyPair, err := session.SigningKeyPair()
@@ -956,8 +1017,8 @@ func buildDatagram1Envelope(payload []byte, session I2CPSession) ([]byte, error)
 // Returns the payload, from destination, and any error (including signature verification failure).
 func parseDatagram1Envelope(data []byte, session I2CPSession) (payload []byte, from *i2cp.Destination, err error) {
 	// Minimum size: Ed25519DestinationSize (391) + Ed25519SignatureLength (64) = 455 bytes
-	if len(data) < Datagram1Overhead {
-		return nil, nil, fmt.Errorf("Datagram1 envelope too short: %d bytes (need at least %d)", len(data), Datagram1Overhead)
+	if len(data) < MinDatagram1Overhead {
+		return nil, nil, fmt.Errorf("Datagram1 envelope too short: %d bytes (need at least %d)", len(data), MinDatagram1Overhead)
 	}
 
 	// Parse destination from the envelope using wire format reader
@@ -1104,9 +1165,9 @@ func buildDatagram2EnvelopeWithOptions(payload []byte, session I2CPSession, targ
 //
 // Returns the payload, from destination, and any error (including signature verification failure).
 func parseDatagram2Envelope(data []byte, session I2CPSession) (payload []byte, from *i2cp.Destination, err error) {
-	// Minimum size: Datagram2Overhead = Ed25519DestinationSize (391) + flags (2) + Ed25519SignatureLength (64) = 457 bytes
-	if len(data) < Datagram2Overhead {
-		return nil, nil, fmt.Errorf("Datagram2 envelope too short: %d bytes (need at least %d)", len(data), Datagram2Overhead)
+	// Minimum size: MinDatagram2Overhead = Ed25519DestinationSize (391) + flags (2) + Ed25519SignatureLength (64) = 457 bytes
+	if len(data) < MinDatagram2Overhead {
+		return nil, nil, fmt.Errorf("Datagram2 envelope too short: %d bytes (need at least %d)", len(data), MinDatagram2Overhead)
 	}
 
 	// Parse destination from the envelope using wire format reader
@@ -1134,8 +1195,18 @@ func parseDatagram2Envelope(data []byte, session I2CPSession) (payload []byte, f
 	// - Bits 0-3: Version (0x02 for Datagram2)
 	// - Bit 4: HEADER_OPTIONS - options field is present
 	// - Bit 5: HEADER_OFFLINE_SIG - offline signature is present
+	// - Bits 6-15: Reserved, must be 0 for forward compatibility
 	// See: https://geti2p.net/spec/datagrams#datagram2
 	flags := data[destLen : destLen+2]
+
+	// Validate reserved bits (6-15) are zero per spec:
+	// "Bits 15-6: unused, set to 0 for compatibility with future uses"
+	// High byte (flags[0]) is entirely reserved; low byte bits 6-7 are reserved.
+	reservedMask := uint16(0xFFC0) // bits 6-15
+	flagsValue := uint16(flags[0])<<8 | uint16(flags[1])
+	if flagsValue&reservedMask != 0 {
+		return nil, nil, fmt.Errorf("Datagram2 has non-zero reserved flag bits: 0x%04x (reserved bits: 0x%04x)", flagsValue, flagsValue&reservedMask)
+	}
 
 	// Parse flags - version is in low byte (bits 0-3)
 	version := flags[1] & 0x0F
