@@ -582,16 +582,17 @@ func (d *DatagramConn) SendTo(payload []byte, destinationB64 string, port uint16
 // The method parses protocol-specific envelopes:
 //   - Raw (18): Payload is returned directly (no envelope)
 //   - Datagram3 (20): Extracts fromhash(32) + flags(2), then payload
-//   - Datagram1 (17): Extracts from destination + signature, then payload (TODO)
-//   - Datagram2 (19): Extracts from + flags + signature, then payload (TODO)
+//   - Datagram1 (17): Extracts from destination + signature, verifies signature, then payload
+//   - Datagram2 (19): Extracts from + flags + signature, verifies with replay prevention, then payload
+//
+// Note: For Datagram3, the sender destination returned is empty because the protocol only
+// includes a hash, not the full destination. Use ReceiveFromWithAddr() to get the hash.
 //
 // Returns an error if:
 //   - The connection is closed
 //   - The read deadline has expired
 //   - The envelope is malformed
-//
-// Note: For MVP, this method reads from an internal queue that must be populated by
-// test injection or I2CP callbacks. Phase 3 will add automatic population via I2CP.
+//   - Signature verification fails (Datagram1/2)
 func (d *DatagramConn) ReceiveFrom() ([]byte, *i2cp.Destination, uint16, error) {
 	d.mu.RLock()
 	closed := d.closed
@@ -736,11 +737,11 @@ func (d *DatagramConn) parseEnvelope(msg *receivedDatagram, protocol uint8) ([]b
 		// Extract payload (everything after offset)
 		payload := msg.payload[offset:]
 
-		// For now, create a minimal destination wrapper with just the hash
-		// In a real implementation, we'd need to look up the full destination
-		// from the network database or cache
+		// Datagram3 only provides sender's hash, not full destination.
+		// Return empty destination for backward compatibility.
+		// Use ReceiveFromWithAddr() to get the sender's hash via I2PAddr.DestinationHash.
 		from := &i2cp.Destination{}
-		_ = fromHash // TODO: Proper destination resolution in Phase 3
+		_ = fromHash // Hash is available via ReceiveFromWithAddr()
 
 		return payload, from, msg.srcPort, nil
 

@@ -117,6 +117,10 @@ Following the patterns from [copilot-instructions.md](.github/copilot-instructio
 
 ## Limitations
 
+**Cryptographic Requirements:**
+
+- **Ed25519 only**: This library exclusively supports Ed25519 destinations and signatures. Legacy DSA_SHA1, ElGamal, and ECDSA signature types are not supported. This aligns with go-i2cp's Ed25519-only approach and I2P's direction toward modern cryptography.
+
 **I2P Datagram Characteristics:**
 
 - **Unreliable delivery**: No automatic retransmission or ordering guarantees
