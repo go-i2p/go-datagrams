@@ -1,9 +1,12 @@
 package datagrams
 
 import (
+	"crypto/ed25519"
 	"encoding/binary"
 	"fmt"
 	"time"
+
+	i2cp "github.com/go-i2p/go-i2cp"
 )
 
 // OfflineSignature represents an I2P Offline Signature block used in Datagram2.
@@ -129,6 +132,82 @@ func (o *OfflineSignature) Len() int {
 // IsExpired returns true if the offline signature has expired.
 func (o *OfflineSignature) IsExpired() bool {
 	return time.Now().After(o.Expires)
+}
+
+// Verify verifies that the offline signature was signed by the destination's key.
+// This proves the destination authorized the transient key to sign on its behalf.
+//
+// Per I2P specification, the offline signature is over:
+//   - expires: 4 bytes (big-endian unsigned seconds since epoch)
+//   - sigtype: 2 bytes (signature type of transient key)
+//   - transient_public_key: variable length based on sigtype
+//
+// Parameters:
+//   - dest: The destination whose key should have signed this offline signature
+//
+// Returns nil if verification succeeds, error otherwise.
+//
+// Note: This library only supports Ed25519 signatures (sigtype 7). Other signature
+// types will return an error.
+func (o *OfflineSignature) Verify(dest *i2cp.Destination) error {
+	if dest == nil {
+		return fmt.Errorf("destination cannot be nil")
+	}
+
+	// Build the data that was signed: expires + sigtype + transient_public_key
+	dataLen := 4 + 2 + len(o.TransientPublicKey)
+	data := make([]byte, dataLen)
+
+	// Encode expires (4 bytes, big-endian)
+	binary.BigEndian.PutUint32(data[0:4], uint32(o.Expires.Unix()))
+
+	// Encode transient sigtype (2 bytes, big-endian)
+	binary.BigEndian.PutUint16(data[4:6], o.TransientSigType)
+
+	// Copy transient public key
+	copy(data[6:], o.TransientPublicKey)
+
+	// Verify using the destination's signing key
+	if !dest.VerifySignature(data, o.Signature) {
+		return fmt.Errorf("offline signature verification failed: destination did not authorize this transient key")
+	}
+
+	return nil
+}
+
+// VerifyPayloadSignature verifies a payload signature using the transient public key.
+// This should be used for Datagram2 payload verification when an offline signature is present.
+//
+// Per I2P specification, when offline signatures are used, the payload is signed by
+// the transient key (not the destination's key), allowing offline destinations to
+// pre-authorize signing.
+//
+// Parameters:
+//   - message: The data that was signed (for Datagram2: target_hash + flags + options + offline_sig + payload)
+//   - signature: The signature to verify
+//
+// Returns true if the signature is valid, false otherwise.
+//
+// Note: This library only supports Ed25519 transient keys (sigtype 7). Other signature
+// types will return false.
+func (o *OfflineSignature) VerifyPayloadSignature(message, signature []byte) bool {
+	// Only Ed25519 (sigtype 7) is supported
+	if o.TransientSigType != 7 {
+		return false
+	}
+
+	// Ed25519 public key must be 32 bytes
+	if len(o.TransientPublicKey) != ed25519.PublicKeySize {
+		return false
+	}
+
+	// Ed25519 signature must be 64 bytes
+	if len(signature) != ed25519.SignatureSize {
+		return false
+	}
+
+	// Verify using the transient public key
+	return ed25519.Verify(ed25519.PublicKey(o.TransientPublicKey), message, signature)
 }
 
 // publicKeyLengthForSigType returns the public key length for a signature type.

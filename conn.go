@@ -683,8 +683,20 @@ const Ed25519SignatureLength = 64
 //
 // Since go-i2cp exclusively uses Ed25519, this implementation always signs the payload directly.
 //
+// IMPORTANT: Per I2P specification, Datagram1 does NOT support offline signatures (LS2 offline keys).
+// Sessions with offline keys should use Datagram2 instead. This implementation cannot currently
+// detect offline keys as go-i2cp doesn't expose this information at the Session level.
+// See: https://geti2p.net/spec/datagrams#notes and Java I2PDatagramMaker.java
+//
 // Returns the complete envelope or an error if signing fails.
 func buildDatagram1Envelope(payload []byte, session I2CPSession) ([]byte, error) {
+	// NOTE: Per spec, Datagram1 does NOT support offline signatures.
+	// The Java reference implementation (I2PDatagramMaker) throws IllegalArgumentException
+	// if session.isOffline() returns true. However, go-i2cp currently doesn't expose
+	// an IsOffline() method on Session, so we cannot perform this check.
+	// TODO: Add IsOffline() check when go-i2cp exposes this method.
+	// For now, users with offline keys should use Datagram2 (protocol 19).
+
 	// Get the session's signing key pair
 	keyPair, err := session.SigningKeyPair()
 	if err != nil {
@@ -938,12 +950,15 @@ func parseDatagram2Envelope(data []byte, session I2CPSession) (payload []byte, f
 
 	// Parse offline signature if present
 	// Format: expires(4) + sigtype(2) + transient_public_key(variable) + signature(variable)
+	var offlineSig *OfflineSignature
 	if hasOfflineSig {
 		// Need to know the destination's signature type for offline sig parsing
 		// Ed25519 (sigtype 7) is the default for go-i2cp destinations
 		destSigType := uint16(7) // Ed25519
 
-		offlineSig, offLen, offErr := OfflineSignatureFromBytes(data[offset:], destSigType)
+		var offLen int
+		var offErr error
+		offlineSig, offLen, offErr = OfflineSignatureFromBytes(data[offset:], destSigType)
 		if offErr != nil {
 			return nil, nil, fmt.Errorf("Datagram2 failed to parse offline signature: %w", offErr)
 		}
@@ -953,15 +968,15 @@ func parseDatagram2Envelope(data []byte, session I2CPSession) (payload []byte, f
 			return nil, nil, fmt.Errorf("Datagram2 offline signature has expired (expired at %s)", offlineSig.Expires)
 		}
 
+		// Verify the offline signature against the sender's destination key
+		// This proves the destination authorized the transient key to sign on its behalf
+		if verifyErr := offlineSig.Verify(from); verifyErr != nil {
+			return nil, nil, fmt.Errorf("Datagram2 offline signature authorization failed: %w", verifyErr)
+		}
+
 		// Store the raw offline signature bytes for signature verification
 		offlineSigBytes = data[offset : offset+offLen]
 		offset += offLen
-
-		// Note: In a full implementation, we would:
-		// 1. Verify the offline signature against the destination's public key
-		// 2. Use the transient key for payload signature verification instead of the destination key
-		// For now, we just parse and validate expiration
-		_ = offlineSig
 	}
 
 	// Remaining data: payload + signature
@@ -1008,10 +1023,20 @@ func parseDatagram2Envelope(data []byte, session I2CPSession) (payload []byte, f
 	}
 	copy(toVerify[verifyOffset:], payload)
 
-	// Verify signature using the sender's destination public key
-	// Note: If offline signature is present, we should use the transient key instead
-	// This is a simplification - full implementation would use transient key when available
-	if !from.VerifySignature(toVerify, signature) {
+	// Verify signature using appropriate key:
+	// - If offline signature present: use transient key from offline signature
+	// - Otherwise: use sender's destination public key
+	var signatureValid bool
+	if offlineSig != nil {
+		// Use the transient key for payload signature verification
+		// The transient key was already validated against the destination's key above
+		signatureValid = offlineSig.VerifyPayloadSignature(toVerify, signature)
+	} else {
+		// Standard verification using sender's destination key
+		signatureValid = from.VerifySignature(toVerify, signature)
+	}
+
+	if !signatureValid {
 		return nil, nil, fmt.Errorf("Datagram2 signature verification failed (possible replay attack or wrong recipient)")
 	}
 
