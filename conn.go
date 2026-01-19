@@ -646,11 +646,12 @@ func (d *DatagramConn) parseEnvelope(msg *receivedDatagram, protocol uint8) ([]b
 		// Extract fromhash (first 32 bytes) - SHA-256 hash of sender's destination
 		fromHash := msg.payload[0:32]
 
-		// Extract flags following Java pattern (Datagram3.java):
-		// - High byte (index 32): ignored per spec
+		// Extract flags per I2P Datagram specification:
+		// Per spec: "flags :: (2 bytes) Bit order: 15 14 ... 3 2 1 0"
+		// - High byte (index 32): reserved, currently unused
 		// - Low byte (index 33): contains version (bits 0-3) and options flag (bit 4)
-		// This matches the Java reference: "in.read(); // ignore high byte, int flags = in.read();"
-		// highFlags := msg.payload[32] // ignored per spec
+		// See: https://geti2p.net/spec/datagrams#datagram3
+		// highFlags := msg.payload[32] // reserved per spec
 		lowFlags := msg.payload[33]
 		version := lowFlags & 0x0F
 		hasOptions := (lowFlags & 0x10) != 0
@@ -666,7 +667,7 @@ func (d *DatagramConn) parseEnvelope(msg *receivedDatagram, protocol uint8) ([]b
 		// Parse options if present (I2P Mapping format: 2-byte size + key=value; pairs)
 		if hasOptions {
 			if len(msg.payload)-offset < 2 {
-				return nil, nil, 0, fmt.Errorf("Datagram3 envelope too short for options size field")
+				return nil, nil, 0, fmt.Errorf("Datagram3 envelope too short for options size field at offset %d: have %d bytes, need at least 2", offset, len(msg.payload)-offset)
 			}
 			opts, optLen, optErr := OptionsFromBytes(msg.payload[offset:])
 			if optErr != nil {
@@ -944,20 +945,25 @@ func parseDatagram2Envelope(data []byte, session I2CPSession) (payload []byte, f
 
 	// Check minimum remaining size for flags + signature
 	if len(data) < destLen+2+Ed25519SignatureLength {
-		return nil, nil, fmt.Errorf("Datagram2 envelope too short after destination: %d bytes remaining", len(data)-destLen)
+		return nil, nil, fmt.Errorf("Datagram2 envelope too short after destination: have %d bytes remaining, need at least %d (flags: 2, signature: %d)", len(data)-destLen, 2+Ed25519SignatureLength, Ed25519SignatureLength)
 	}
 
-	// Extract flags (2 bytes)
+	// Extract flags (2 bytes) per I2P Datagram specification
+	// Per spec: "flags :: (2 bytes) Bit order: 15 14 ... 3 2 1 0"
+	// - Bits 0-3: Version (0x02 for Datagram2)
+	// - Bit 4: HEADER_OPTIONS - options field is present
+	// - Bit 5: HEADER_OFFLINE_SIG - offline signature is present
+	// See: https://geti2p.net/spec/datagrams#datagram2
 	flags := data[destLen : destLen+2]
 
 	// Parse flags - version is in low byte (bits 0-3)
 	version := flags[1] & 0x0F
 	if version != 0x02 {
-		return nil, nil, fmt.Errorf("invalid Datagram2 version: 0x%x (expected 0x02)", version)
+		return nil, nil, fmt.Errorf("invalid Datagram2 version: 0x%02x (expected 0x02)", version)
 	}
 
-	hasOptions := (flags[1] & 0x10) != 0
-	hasOfflineSig := (flags[1] & 0x20) != 0
+	hasOptions := (flags[1] & 0x10) != 0    // Bit 4: HEADER_OPTIONS
+	hasOfflineSig := (flags[1] & 0x20) != 0 // Bit 5: HEADER_OFFLINE_SIG
 
 	offset := destLen + 2
 
@@ -968,7 +974,7 @@ func parseDatagram2Envelope(data []byte, session I2CPSession) (payload []byte, f
 	// Parse options if present (I2P Mapping format: 2-byte size + key=value; pairs)
 	if hasOptions {
 		if len(data)-offset < 2 {
-			return nil, nil, fmt.Errorf("Datagram2 envelope too short for options size field")
+			return nil, nil, fmt.Errorf("Datagram2 envelope too short for options size field at offset %d: have %d bytes, need at least 2", offset, len(data)-offset)
 		}
 		opts, optLen, optErr := OptionsFromBytes(data[offset:])
 		if optErr != nil {
@@ -1015,7 +1021,7 @@ func parseDatagram2Envelope(data []byte, session I2CPSession) (payload []byte, f
 	// Remaining data: payload + signature
 	// Ed25519 signature is always 64 bytes and is at the END
 	if len(data)-offset < Ed25519SignatureLength {
-		return nil, nil, fmt.Errorf("Datagram2 envelope too short for signature")
+		return nil, nil, fmt.Errorf("Datagram2 envelope too short for signature at offset %d: have %d bytes, need %d", offset, len(data)-offset, Ed25519SignatureLength)
 	}
 
 	// Split payload and signature (signature is at end)
