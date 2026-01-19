@@ -187,6 +187,7 @@ type DatagramConn struct {
 type receivedDatagram struct {
 	payload  []byte
 	from     *i2cp.Destination
+	fromHash [32]byte // SHA-256 hash of sender's destination (used by Datagram3)
 	protocol uint8
 	srcPort  uint16
 	destPort uint16
@@ -629,6 +630,60 @@ func (d *DatagramConn) ReceiveFrom() ([]byte, *i2cp.Destination, uint16, error) 
 	}
 }
 
+// ReceiveFromWithAddr receives a datagram and returns the payload, sender address, and an error.
+// This method provides more complete sender information than ReceiveFrom, including the
+// destination hash for Datagram3 protocol messages.
+//
+// For Datagram3 (protocol 20), only the sender's destination hash is available in the
+// protocol, not the full destination. Use addr.IsHashOnly() to check this condition.
+// To reply to a Datagram3 sender, applications need to look up the full destination
+// from a cache or the network database using addr.DestinationHash.
+//
+// This method blocks until a datagram is received or an error occurs. It respects the
+// read deadline set by SetReadDeadline() or SetDeadline().
+//
+// Returns an error if:
+//   - The connection is closed
+//   - The read deadline has expired
+//   - The envelope is malformed
+func (d *DatagramConn) ReceiveFromWithAddr() ([]byte, *I2PAddr, error) {
+	d.mu.RLock()
+	closed := d.closed
+	deadline := d.readDeadline
+	protocol := d.protocol
+	d.mu.RUnlock()
+
+	if closed {
+		return nil, nil, net.ErrClosed
+	}
+
+	// Set up deadline timeout if specified
+	var timer *time.Timer
+	var timeoutChan <-chan time.Time
+	if !deadline.IsZero() {
+		timeout := time.Until(deadline)
+		if timeout <= 0 {
+			return nil, nil, fmt.Errorf("read deadline exceeded")
+		}
+		timer = time.NewTimer(timeout)
+		defer timer.Stop()
+		timeoutChan = timer.C
+	}
+
+	// Block until message received, deadline, or context cancelled
+	select {
+	case msg := <-d.recvQueue:
+		// Parse protocol-specific envelope and return as I2PAddr
+		return d.parseEnvelopeToAddr(msg, protocol)
+
+	case <-timeoutChan:
+		return nil, nil, fmt.Errorf("read deadline exceeded")
+
+	case <-d.ctx.Done():
+		return nil, nil, net.ErrClosed
+	}
+}
+
 // parseEnvelope extracts the payload and sender information from a protocol-specific envelope.
 func (d *DatagramConn) parseEnvelope(msg *receivedDatagram, protocol uint8) ([]byte, *i2cp.Destination, uint16, error) {
 	switch protocol {
@@ -707,6 +762,131 @@ func (d *DatagramConn) parseEnvelope(msg *receivedDatagram, protocol uint8) ([]b
 
 	default:
 		return nil, nil, 0, fmt.Errorf("unsupported protocol for receive: %d", protocol)
+	}
+}
+
+// parseEnvelopeToAddr extracts the payload and sender information from a protocol-specific envelope,
+// returning the sender info as an I2PAddr for more complete representation including destination hash.
+//
+// This is particularly important for Datagram3 where only the sender's hash is available,
+// not the full destination. The I2PAddr will have IsHashOnly() return true in this case.
+func (d *DatagramConn) parseEnvelopeToAddr(msg *receivedDatagram, protocol uint8) ([]byte, *I2PAddr, error) {
+	switch protocol {
+	case ProtocolRaw:
+		// Raw datagrams have no envelope, payload is direct
+		// Note: Raw datagrams are not repliable - no sender info available
+		addr := &I2PAddr{
+			Port: msg.srcPort,
+		}
+		// If we have sender info (from I2CP metadata), populate it
+		if msg.from != nil {
+			addr.Destination = msg.from.Base64()
+			// Compute hash from destination for completeness
+			destStream := i2cp.NewStream(nil)
+			if err := msg.from.WriteToStream(destStream); err == nil {
+				addr.DestinationHash = sha256.Sum256(destStream.Bytes())
+			}
+		}
+		return msg.payload, addr, nil
+
+	case ProtocolDatagram3:
+		// Datagram3: fromhash(32) + flags(2) + [options] + payload
+		// See SPEC.md and https://geti2p.net/spec/datagrams#datagram3 for format details
+		if len(msg.payload) < 34 {
+			return nil, nil, fmt.Errorf("Datagram3 envelope too short: %d bytes, need at least 34", len(msg.payload))
+		}
+
+		// Extract fromhash (first 32 bytes) - SHA-256 hash of sender's destination
+		var fromHash [32]byte
+		copy(fromHash[:], msg.payload[0:32])
+
+		// Extract flags per I2P Datagram specification:
+		// Per spec: "flags :: (2 bytes) Bit order: 15 14 ... 3 2 1 0"
+		// - High byte (index 32): reserved, currently unused
+		// - Low byte (index 33): contains version (bits 0-3) and options flag (bit 4)
+		// See: https://geti2p.net/spec/datagrams#datagram3
+		lowFlags := msg.payload[33]
+		version := lowFlags & 0x0F
+		hasOptions := (lowFlags & 0x10) != 0
+
+		// Verify version bits (should be 0x03 for Datagram3)
+		if version != 0x03 {
+			return nil, nil, fmt.Errorf("invalid Datagram3 version: 0x%x (expected 0x03)", version)
+		}
+
+		// Start of payload (after fromhash + flags)
+		offset := 34
+
+		// Parse options if present (I2P Mapping format: 2-byte size + key=value; pairs)
+		if hasOptions {
+			if len(msg.payload)-offset < 2 {
+				return nil, nil, fmt.Errorf("Datagram3 envelope too short for options size field at offset %d: have %d bytes, need at least 2", offset, len(msg.payload)-offset)
+			}
+			opts, optLen, optErr := OptionsFromBytes(msg.payload[offset:])
+			if optErr != nil {
+				return nil, nil, fmt.Errorf("Datagram3 failed to parse options: %w", optErr)
+			}
+			offset += optLen
+			// Options are parsed but not exposed in return value (could be added later)
+			_ = opts
+		}
+
+		// Extract payload (everything after offset)
+		payload := msg.payload[offset:]
+
+		// Return I2PAddr with hash-only sender identification
+		// Datagram3 protocol only provides the hash, not the full destination
+		// Applications needing the full destination must look it up from netdb or cache
+		addr := &I2PAddr{
+			Destination:     "", // Not available in Datagram3 protocol
+			DestinationHash: fromHash,
+			Port:            msg.srcPort,
+		}
+
+		return payload, addr, nil
+
+	case ProtocolDatagram1:
+		// Datagram1: from dest(387+) + signature(40+) + payload
+		payload, from, err := parseDatagram1Envelope(msg.payload, d.session)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to parse Datagram1 envelope: %w", err)
+		}
+
+		addr := &I2PAddr{
+			Port: msg.srcPort,
+		}
+		if from != nil {
+			addr.Destination = from.Base64()
+			// Compute hash from destination
+			destStream := i2cp.NewStream(nil)
+			if err := from.WriteToStream(destStream); err == nil {
+				addr.DestinationHash = sha256.Sum256(destStream.Bytes())
+			}
+		}
+		return payload, addr, nil
+
+	case ProtocolDatagram2:
+		// Datagram2: from dest(387+) + flags(2) + options(optional) + offline_sig(optional) + payload + signature(40+)
+		payload, from, err := parseDatagram2Envelope(msg.payload, d.session)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to parse Datagram2 envelope: %w", err)
+		}
+
+		addr := &I2PAddr{
+			Port: msg.srcPort,
+		}
+		if from != nil {
+			addr.Destination = from.Base64()
+			// Compute hash from destination
+			destStream := i2cp.NewStream(nil)
+			if err := from.WriteToStream(destStream); err == nil {
+				addr.DestinationHash = sha256.Sum256(destStream.Bytes())
+			}
+		}
+		return payload, addr, nil
+
+	default:
+		return nil, nil, fmt.Errorf("unsupported protocol for receive: %d", protocol)
 	}
 }
 

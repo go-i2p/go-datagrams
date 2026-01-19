@@ -2324,3 +2324,219 @@ func TestReceiveLoop_HandlerPanic(t *testing.T) {
 		t.Fatal("Receive loop appears to have stopped after handler panic")
 	}
 }
+
+// TestReceiveFromWithAddr_Raw tests receiving Raw protocol datagrams with address info.
+func TestReceiveFromWithAddr_Raw(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConn(session, 8080)
+	if err != nil {
+		t.Fatalf("NewDatagramConn() failed: %v", err)
+	}
+	defer conn.Close()
+
+	// Create a test destination
+	crypto := i2cp.NewCrypto()
+	fromDest, _ := i2cp.NewDestination(crypto)
+
+	// Inject a message
+	payload := []byte("test message")
+	err = conn.injectMessage(payload, fromDest, ProtocolRaw, 9090, 8080)
+	if err != nil {
+		t.Fatalf("injectMessage() failed: %v", err)
+	}
+
+	// Receive the message with address info
+	receivedPayload, addr, err := conn.ReceiveFromWithAddr()
+	if err != nil {
+		t.Fatalf("ReceiveFromWithAddr() failed: %v", err)
+	}
+
+	// Verify payload
+	if string(receivedPayload) != string(payload) {
+		t.Errorf("payload = %q, want %q", receivedPayload, payload)
+	}
+
+	// Verify address has destination
+	if !addr.HasFullDestination() {
+		t.Error("HasFullDestination() = false, want true for Raw with known sender")
+	}
+
+	// Verify port
+	if addr.Port != 9090 {
+		t.Errorf("Port = %d, want 9090", addr.Port)
+	}
+
+	// Verify destination is base64 encoded
+	if addr.Destination != fromDest.Base64() {
+		t.Error("Destination doesn't match sender")
+	}
+
+	// Verify hash is computed
+	if !addr.HasDestinationHash() {
+		t.Error("HasDestinationHash() = false, want true (computed from destination)")
+	}
+}
+
+// TestReceiveFromWithAddr_Datagram3 tests receiving Datagram3 protocol with hash-only sender.
+func TestReceiveFromWithAddr_Datagram3(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConnWithProtocol(session, 8080, ProtocolDatagram3)
+	if err != nil {
+		t.Fatalf("NewDatagramConnWithProtocol() failed: %v", err)
+	}
+	defer conn.Close()
+
+	// Create a test destination
+	crypto := i2cp.NewCrypto()
+	fromDest, _ := i2cp.NewDestination(crypto)
+
+	// Construct Datagram3 envelope: fromhash(32) + flags(2) + payload
+	payload := []byte("test message")
+	destStream := i2cp.NewStream(nil)
+	fromDest.WriteToStream(destStream)
+	fromHash := sha256.Sum256(destStream.Bytes())
+
+	envelope := make([]byte, 32+2+len(payload))
+	copy(envelope[0:32], fromHash[:])
+	envelope[32] = 0x00 // flags high byte
+	envelope[33] = 0x03 // flags low byte (version 0x03)
+	copy(envelope[34:], payload)
+
+	// Inject the message with envelope
+	err = conn.injectMessage(envelope, fromDest, ProtocolDatagram3, 9090, 8080)
+	if err != nil {
+		t.Fatalf("injectMessage() failed: %v", err)
+	}
+
+	// Receive the message with address info
+	receivedPayload, addr, err := conn.ReceiveFromWithAddr()
+	if err != nil {
+		t.Fatalf("ReceiveFromWithAddr() failed: %v", err)
+	}
+
+	// Verify payload was extracted correctly
+	if string(receivedPayload) != string(payload) {
+		t.Errorf("payload = %q, want %q", receivedPayload, payload)
+	}
+
+	// Verify port
+	if addr.Port != 9090 {
+		t.Errorf("Port = %d, want 9090", addr.Port)
+	}
+
+	// KEY TEST: Datagram3 should be hash-only
+	if !addr.IsHashOnly() {
+		t.Error("IsHashOnly() = false, want true for Datagram3")
+	}
+
+	// Verify hash is populated
+	if !addr.HasDestinationHash() {
+		t.Error("HasDestinationHash() = false, want true for Datagram3")
+	}
+
+	// Verify the hash matches what we sent
+	if addr.DestinationHash != fromHash {
+		t.Errorf("DestinationHash mismatch: got %x, want %x", addr.DestinationHash, fromHash)
+	}
+
+	// Verify no full destination is available
+	if addr.HasFullDestination() {
+		t.Error("HasFullDestination() = true, want false for Datagram3")
+	}
+
+	// Verify Destination is empty
+	if addr.Destination != "" {
+		t.Errorf("Destination = %q, want empty string for Datagram3", addr.Destination)
+	}
+}
+
+// TestReceiveFromWithAddr_Datagram3_WithOptions tests Datagram3 parsing with options flag set.
+func TestReceiveFromWithAddr_Datagram3_WithOptions(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConnWithProtocol(session, 8080, ProtocolDatagram3)
+	if err != nil {
+		t.Fatalf("NewDatagramConnWithProtocol() failed: %v", err)
+	}
+	defer conn.Close()
+
+	// Create a test destination
+	crypto := i2cp.NewCrypto()
+	fromDest, _ := i2cp.NewDestination(crypto)
+
+	// Compute hash
+	destStream := i2cp.NewStream(nil)
+	fromDest.WriteToStream(destStream)
+	fromHash := sha256.Sum256(destStream.Bytes())
+
+	// Create options (empty options with 2-byte size = 0)
+	options := []byte{0x00, 0x00} // size = 0
+
+	// Construct Datagram3 envelope with options flag: fromhash(32) + flags(2) + options(2) + payload
+	payload := []byte("test with options")
+	envelope := make([]byte, 32+2+len(options)+len(payload))
+	copy(envelope[0:32], fromHash[:])
+	envelope[32] = 0x00 // flags high byte
+	envelope[33] = 0x13 // flags low byte: version 0x03 + options bit (0x10)
+	copy(envelope[34:], options)
+	copy(envelope[34+len(options):], payload)
+
+	// Inject the message
+	err = conn.injectMessage(envelope, fromDest, ProtocolDatagram3, 9090, 8080)
+	if err != nil {
+		t.Fatalf("injectMessage() failed: %v", err)
+	}
+
+	// Receive the message
+	receivedPayload, addr, err := conn.ReceiveFromWithAddr()
+	if err != nil {
+		t.Fatalf("ReceiveFromWithAddr() failed: %v", err)
+	}
+
+	// Verify payload was extracted correctly (options should be skipped)
+	if string(receivedPayload) != string(payload) {
+		t.Errorf("payload = %q, want %q", receivedPayload, payload)
+	}
+
+	// Verify hash is correct
+	if addr.DestinationHash != fromHash {
+		t.Errorf("DestinationHash mismatch")
+	}
+}
+
+// TestReceiveFromWithAddr_ClosedConnection tests receiving on a closed connection.
+func TestReceiveFromWithAddr_ClosedConnection(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConn(session, 8080)
+	if err != nil {
+		t.Fatalf("NewDatagramConn() failed: %v", err)
+	}
+
+	conn.Close()
+
+	_, _, err = conn.ReceiveFromWithAddr()
+	if err != net.ErrClosed {
+		t.Errorf("ReceiveFromWithAddr() on closed connection error = %v, want %v", err, net.ErrClosed)
+	}
+}
+
+// TestReceiveFromWithAddr_ReadDeadline tests read deadline handling.
+func TestReceiveFromWithAddr_ReadDeadline(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConn(session, 8080)
+	if err != nil {
+		t.Fatalf("NewDatagramConn() failed: %v", err)
+	}
+	defer conn.Close()
+
+	// Set deadline in the past
+	conn.SetReadDeadline(time.Now().Add(-1 * time.Second))
+
+	_, _, err = conn.ReceiveFromWithAddr()
+	if err == nil {
+		t.Error("ReceiveFromWithAddr() after deadline should return error")
+	}
+
+	if err != nil && err.Error()[:13] != "read deadline" {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}

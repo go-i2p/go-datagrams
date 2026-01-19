@@ -293,6 +293,206 @@ func TestI2PAddr_NetAddrInterface(t *testing.T) {
 	var _ net.Addr = (*I2PAddr)(nil) // Compile-time interface check
 }
 
+// TestI2PAddr_HasFullDestination verifies the HasFullDestination method.
+func TestI2PAddr_HasFullDestination(t *testing.T) {
+	tests := []struct {
+		name string
+		addr *I2PAddr
+		want bool
+	}{
+		{
+			name: "has destination",
+			addr: &I2PAddr{
+				Destination: "test.i2p",
+				Port:        8080,
+			},
+			want: true,
+		},
+		{
+			name: "empty destination",
+			addr: &I2PAddr{
+				Destination: "",
+				Port:        8080,
+			},
+			want: false,
+		},
+		{
+			name: "hash only (Datagram3 style)",
+			addr: &I2PAddr{
+				Destination:     "",
+				DestinationHash: [32]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
+				Port:            8080,
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.addr.HasFullDestination(); got != tt.want {
+				t.Errorf("HasFullDestination() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestI2PAddr_HasDestinationHash verifies the HasDestinationHash method.
+func TestI2PAddr_HasDestinationHash(t *testing.T) {
+	tests := []struct {
+		name string
+		addr *I2PAddr
+		want bool
+	}{
+		{
+			name: "has hash",
+			addr: &I2PAddr{
+				DestinationHash: [32]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
+				Port:            8080,
+			},
+			want: true,
+		},
+		{
+			name: "zero hash",
+			addr: &I2PAddr{
+				Destination: "test.i2p",
+				Port:        8080,
+			},
+			want: false,
+		},
+		{
+			name: "all zeros hash",
+			addr: &I2PAddr{
+				DestinationHash: [32]byte{},
+				Port:            8080,
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.addr.HasDestinationHash(); got != tt.want {
+				t.Errorf("HasDestinationHash() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestI2PAddr_IsHashOnly verifies the IsHashOnly method.
+func TestI2PAddr_IsHashOnly(t *testing.T) {
+	tests := []struct {
+		name string
+		addr *I2PAddr
+		want bool
+	}{
+		{
+			name: "hash only (Datagram3 style)",
+			addr: &I2PAddr{
+				Destination:     "",
+				DestinationHash: [32]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
+				Port:            8080,
+			},
+			want: true,
+		},
+		{
+			name: "both destination and hash",
+			addr: &I2PAddr{
+				Destination:     "test.i2p",
+				DestinationHash: [32]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
+				Port:            8080,
+			},
+			want: false,
+		},
+		{
+			name: "destination only",
+			addr: &I2PAddr{
+				Destination: "test.i2p",
+				Port:        8080,
+			},
+			want: false,
+		},
+		{
+			name: "neither destination nor hash",
+			addr: &I2PAddr{
+				Port: 8080,
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.addr.IsHashOnly(); got != tt.want {
+				t.Errorf("IsHashOnly() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestI2PAddr_Equal_WithHash verifies equality comparison includes destination hash.
+func TestI2PAddr_Equal_WithHash(t *testing.T) {
+	hash1 := [32]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32}
+	hash2 := [32]byte{32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1}
+
+	tests := []struct {
+		name string
+		a    *I2PAddr
+		b    *I2PAddr
+		want bool
+	}{
+		{
+			name: "equal with same hash",
+			a: &I2PAddr{
+				Destination:     "",
+				DestinationHash: hash1,
+				Port:            8080,
+			},
+			b: &I2PAddr{
+				Destination:     "",
+				DestinationHash: hash1,
+				Port:            8080,
+			},
+			want: true,
+		},
+		{
+			name: "different hashes",
+			a: &I2PAddr{
+				Destination:     "",
+				DestinationHash: hash1,
+				Port:            8080,
+			},
+			b: &I2PAddr{
+				Destination:     "",
+				DestinationHash: hash2,
+				Port:            8080,
+			},
+			want: false,
+		},
+		{
+			name: "same destination but different hashes",
+			a: &I2PAddr{
+				Destination:     "test.i2p",
+				DestinationHash: hash1,
+				Port:            8080,
+			},
+			b: &I2PAddr{
+				Destination:     "test.i2p",
+				DestinationHash: hash2,
+				Port:            8080,
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.a.Equal(tt.b); got != tt.want {
+				t.Errorf("Equal() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // BenchmarkI2PAddr_String benchmarks the String() method.
 func BenchmarkI2PAddr_String(b *testing.B) {
 	addr := &I2PAddr{

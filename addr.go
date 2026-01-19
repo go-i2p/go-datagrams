@@ -13,10 +13,25 @@ import (
 // I2P destinations are base64-encoded strings that uniquely identify an endpoint
 // in the I2P network. Ports provide application-level multiplexing on top of a
 // single I2CP session.
+//
+// For Datagram3 (protocol 20), only the DestinationHash is available since the
+// protocol only includes a 32-byte hash of the sender's destination, not the full
+// destination. Applications can use HasDestinationHash() to check if the hash is
+// populated and HasFullDestination() to check if the full destination is available.
+// To reply to a Datagram3 sender, applications need to look up the full destination
+// from a cache or the network database using the hash.
 type I2PAddr struct {
 	// Destination is the I2P destination string (base64-encoded)
 	// Empty string represents an unknown or anonymous sender (e.g., Raw datagrams)
+	// or a Datagram3 sender where only the hash is known.
 	Destination string
+
+	// DestinationHash is the SHA-256 hash of the sender's destination (32 bytes).
+	// This is populated for Datagram3 messages where only the hash is included
+	// in the protocol. For other protocol types, this may be computed from the
+	// Destination field or left as zero.
+	// Use HasDestinationHash() to check if this field is populated.
+	DestinationHash [32]byte
 
 	// Port is the UDP port number for application-level routing (1-65535)
 	Port uint16
@@ -84,13 +99,36 @@ func ParseI2PAddr(addr string) (*I2PAddr, error) {
 	}, nil
 }
 
+// HasFullDestination returns true if this address has a full destination string.
+// When false, the address may have only a hash (for Datagram3) or be empty (for Raw).
+func (a *I2PAddr) HasFullDestination() bool {
+	return a.Destination != ""
+}
+
+// HasDestinationHash returns true if this address has a populated destination hash.
+// This is always true for Datagram3 senders and may be true for other protocols
+// if the hash was computed from the full destination.
+func (a *I2PAddr) HasDestinationHash() bool {
+	// Check if hash is non-zero (any byte is non-zero)
+	var zeroHash [32]byte
+	return a.DestinationHash != zeroHash
+}
+
+// IsHashOnly returns true if only the hash is available without a full destination.
+// This is the case for Datagram3 senders where the protocol only includes the hash.
+func (a *I2PAddr) IsHashOnly() bool {
+	return a.HasDestinationHash() && !a.HasFullDestination()
+}
+
 // Equal returns true if two I2P addresses are equal.
-// Compares both destination string and port number.
+// Compares destination string, destination hash, and port number.
 func (a *I2PAddr) Equal(other *I2PAddr) bool {
 	if a == nil || other == nil {
 		return a == other
 	}
-	return a.Destination == other.Destination && a.Port == other.Port
+	return a.Destination == other.Destination &&
+		a.DestinationHash == other.DestinationHash &&
+		a.Port == other.Port
 }
 
 // AsNetAddr returns the I2PAddr as a net.Addr interface.
