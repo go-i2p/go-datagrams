@@ -778,6 +778,39 @@ func TestSendTo_Datagram2(t *testing.T) {
 	}
 }
 
+// TestSendTo_Datagram2_OfflineKeysNotSupported tests that Datagram2 returns a clear error when
+// attempting to send with offline keys (LS2 offline signatures).
+// While Datagram2 is designed to support offline signatures per the I2P specification,
+// this implementation does not yet support SENDING with offline signatures because
+// go-i2cp would need to expose the transient signing key.
+// Receiving Datagram2 with offline signatures IS supported.
+func TestSendTo_Datagram2_OfflineKeysNotSupported(t *testing.T) {
+	session := newMockSession()
+	session.offline = true // Simulate session with offline keys (LS2)
+
+	conn, err := NewDatagramConnWithProtocol(session, 8080, ProtocolDatagram2)
+	if err != nil {
+		t.Fatalf("NewDatagramConnWithProtocol() failed: %v", err)
+	}
+	defer conn.Close()
+
+	// Try to send - should fail because session has offline keys
+	err = conn.SendTo([]byte("test"), validDestinationB64(), 9090)
+	if err == nil {
+		t.Error("SendTo() with Datagram2 and offline keys should return error")
+	}
+
+	// Verify error message mentions offline signatures
+	if err != nil && !strings.Contains(err.Error(), "offline") {
+		t.Errorf("error should mention offline signatures: %v", err)
+	}
+
+	// Verify error mentions go-i2cp requirement (explains why not supported)
+	if err != nil && !strings.Contains(err.Error(), "go-i2cp") {
+		t.Errorf("error should mention go-i2cp dependency: %v", err)
+	}
+}
+
 // TestMaxPayloadSize tests the MaxPayloadSize calculation for each protocol.
 func TestMaxPayloadSize(t *testing.T) {
 	session := newMockSession()
@@ -1217,10 +1250,11 @@ func TestDatagram2Envelope_Roundtrip(t *testing.T) {
 	session := newMockSession()
 
 	// Compute target destination hash from session's own destination (self-send scenario)
+	// Uses WriteToStream for canonical serialization, matching the implementation
 	localDest := session.Destination()
 	destStream := i2cp.NewStream(nil)
-	if err := localDest.WriteToMessage(destStream); err != nil {
-		t.Fatalf("WriteToMessage() failed: %v", err)
+	if err := localDest.WriteToStream(destStream); err != nil {
+		t.Fatalf("WriteToStream() failed: %v", err)
 	}
 	targetHash := sha256.Sum256(destStream.Bytes())
 
@@ -1273,10 +1307,11 @@ func TestDatagram2Envelope_RoundtripWithOptions(t *testing.T) {
 	session := newMockSession()
 
 	// Compute target destination hash
+	// Uses WriteToStream for canonical serialization, matching the implementation
 	localDest := session.Destination()
 	destStream := i2cp.NewStream(nil)
-	if err := localDest.WriteToMessage(destStream); err != nil {
-		t.Fatalf("WriteToMessage() failed: %v", err)
+	if err := localDest.WriteToStream(destStream); err != nil {
+		t.Fatalf("WriteToStream() failed: %v", err)
 	}
 	targetHash := sha256.Sum256(destStream.Bytes())
 
@@ -1318,11 +1353,12 @@ func TestDatagram2Envelope_ReplayPrevention(t *testing.T) {
 	session := newMockSession()
 
 	// Create a different target destination (simulating sending to someone else)
+	// Uses WriteToStream for canonical hash computation, matching the implementation
 	crypto := i2cp.NewCrypto()
 	otherDest, _ := i2cp.NewDestination(crypto)
 	otherStream := i2cp.NewStream(nil)
-	if err := otherDest.WriteToMessage(otherStream); err != nil {
-		t.Fatalf("WriteToMessage() failed: %v", err)
+	if err := otherDest.WriteToStream(otherStream); err != nil {
+		t.Fatalf("WriteToStream() failed: %v", err)
 	}
 	otherHash := sha256.Sum256(otherStream.Bytes())
 
@@ -1352,12 +1388,13 @@ func TestDatagram2Envelope_ReservedFlagBits(t *testing.T) {
 	session := newMockSession()
 
 	// Compute target destination hash from session's own destination
+	// Uses WriteToStream for canonical hash computation, matching the implementation
 	localDest := session.Destination()
-	destStream := i2cp.NewStream(nil)
-	if err := localDest.WriteToMessage(destStream); err != nil {
-		t.Fatalf("WriteToMessage() failed: %v", err)
+	hashStream := i2cp.NewStream(nil)
+	if err := localDest.WriteToStream(hashStream); err != nil {
+		t.Fatalf("WriteToStream() failed: %v", err)
 	}
-	targetHash := sha256.Sum256(destStream.Bytes())
+	targetHash := sha256.Sum256(hashStream.Bytes())
 
 	// Build a valid Datagram2 envelope first
 	payload := []byte("test payload")
@@ -1367,6 +1404,11 @@ func TestDatagram2Envelope_ReservedFlagBits(t *testing.T) {
 	}
 
 	// Find flags position (after destination)
+	// Envelope uses WriteToMessage for destination wire format (different from hash computation)
+	destStream := i2cp.NewStream(nil)
+	if err := localDest.WriteToMessage(destStream); err != nil {
+		t.Fatalf("WriteToMessage() failed: %v", err)
+	}
 	destLen := destStream.Len()
 
 	testCases := []struct {
@@ -1566,9 +1608,10 @@ func TestEnvelope_MaxPayloadSize(t *testing.T) {
 			maxPayload: MaxI2NPSize - MinDatagram2Overhead,
 			overhead:   MinDatagram2Overhead,
 			buildEnvelope: func(payload []byte) ([]byte, error) {
+				// Uses WriteToStream for canonical hash computation, matching the implementation
 				localDest := session.Destination()
 				destStream := i2cp.NewStream(nil)
-				if err := localDest.WriteToMessage(destStream); err != nil {
+				if err := localDest.WriteToStream(destStream); err != nil {
 					return nil, err
 				}
 				targetHash := sha256.Sum256(destStream.Bytes())
@@ -3053,5 +3096,409 @@ func TestReceiveFromWithAddr_ReadDeadline(t *testing.T) {
 
 	if err != nil && err.Error()[:13] != "read deadline" {
 		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+// TestSendToWithOptions_Datagram3 tests sending a Datagram3 with options.
+func TestSendToWithOptions_Datagram3(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConnWithProtocol(session, 8080, ProtocolDatagram3)
+	if err != nil {
+		t.Fatalf("NewDatagramConnWithProtocol() failed: %v", err)
+	}
+	defer conn.Close()
+
+	payload := []byte("hello with options")
+	destB64 := validDestinationB64()
+	options := NewOptions(map[string]string{
+		"version": "1.0",
+		"app":     "test",
+	})
+
+	err = conn.SendToWithOptions(payload, destB64, 9090, options)
+	if err != nil {
+		t.Errorf("SendToWithOptions() error = %v", err)
+	}
+
+	// Verify envelope structure
+	sent := session.lastPayload
+	if len(sent) < 34 {
+		t.Fatalf("envelope too short: %d bytes", len(sent))
+	}
+
+	// Check flags: version 0x03 with options flag set
+	lowFlags := sent[33]
+	if lowFlags != 0x13 { // 0x03 (version) | 0x10 (options flag)
+		t.Errorf("flags = 0x%02x, want 0x13", lowFlags)
+	}
+}
+
+// TestSendToWithOptions_Datagram3_NilOptions tests sending Datagram3 without options.
+func TestSendToWithOptions_Datagram3_NilOptions(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConnWithProtocol(session, 8080, ProtocolDatagram3)
+	if err != nil {
+		t.Fatalf("NewDatagramConnWithProtocol() failed: %v", err)
+	}
+	defer conn.Close()
+
+	payload := []byte("hello no options")
+	destB64 := validDestinationB64()
+
+	err = conn.SendToWithOptions(payload, destB64, 9090, nil)
+	if err != nil {
+		t.Errorf("SendToWithOptions() error = %v", err)
+	}
+
+	// Verify envelope structure
+	sent := session.lastPayload
+	if len(sent) < 34 {
+		t.Fatalf("envelope too short: %d bytes", len(sent))
+	}
+
+	// Check flags: version 0x03 without options flag
+	lowFlags := sent[33]
+	if lowFlags != 0x03 {
+		t.Errorf("flags = 0x%02x, want 0x03", lowFlags)
+	}
+}
+
+// TestSendToWithOptions_Datagram2 tests sending a Datagram2 with options.
+func TestSendToWithOptions_Datagram2(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConnWithProtocol(session, 8080, ProtocolDatagram2)
+	if err != nil {
+		t.Fatalf("NewDatagramConnWithProtocol() failed: %v", err)
+	}
+	defer conn.Close()
+
+	payload := []byte("authenticated with options")
+	destB64 := validDestinationB64()
+	options := NewOptions(map[string]string{
+		"key": "value",
+	})
+
+	err = conn.SendToWithOptions(payload, destB64, 9090, options)
+	if err != nil {
+		t.Errorf("SendToWithOptions() error = %v", err)
+	}
+
+	// Verify envelope was built correctly
+	sent := session.lastPayload
+	if len(sent) < MinDatagram2Overhead {
+		t.Fatalf("envelope too short: %d bytes, need at least %d", len(sent), MinDatagram2Overhead)
+	}
+}
+
+// TestSendToWithOptions_Raw_IgnoresOptions tests that Raw protocol ignores options.
+func TestSendToWithOptions_Raw_IgnoresOptions(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConnWithProtocol(session, 8080, ProtocolRaw)
+	if err != nil {
+		t.Fatalf("NewDatagramConnWithProtocol() failed: %v", err)
+	}
+	defer conn.Close()
+
+	payload := []byte("raw payload")
+	destB64 := validDestinationB64()
+	options := NewOptions(map[string]string{"ignored": "true"})
+
+	err = conn.SendToWithOptions(payload, destB64, 9090, options)
+	if err != nil {
+		t.Errorf("SendToWithOptions() error = %v", err)
+	}
+
+	// Raw should send payload directly without envelope
+	if string(session.lastPayload) != string(payload) {
+		t.Errorf("Raw protocol should send payload directly, got %d bytes", len(session.lastPayload))
+	}
+}
+
+// TestSendToWithOptions_ClosedConnection tests sending on a closed connection.
+func TestSendToWithOptions_ClosedConnection(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConnWithProtocol(session, 8080, ProtocolDatagram3)
+	if err != nil {
+		t.Fatalf("NewDatagramConnWithProtocol() failed: %v", err)
+	}
+	conn.Close()
+
+	err = conn.SendToWithOptions([]byte("test"), validDestinationB64(), 9090, nil)
+	if err != net.ErrClosed {
+		t.Errorf("SendToWithOptions() on closed connection error = %v, want %v", err, net.ErrClosed)
+	}
+}
+
+// TestSendToWithOptions_OptionsTooLarge tests error handling for oversized options.
+func TestSendToWithOptions_OptionsTooLarge(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConnWithProtocol(session, 8080, ProtocolDatagram3)
+	if err != nil {
+		t.Fatalf("NewDatagramConnWithProtocol() failed: %v", err)
+	}
+	defer conn.Close()
+
+	// Create large payload that, combined with options, would exceed max
+	maxPayload := conn.MaxPayloadSize()
+	largePayload := make([]byte, maxPayload-10) // Leave only 10 bytes room
+	options := NewOptions(map[string]string{
+		"largekey": strings.Repeat("x", 200), // Options will be > 10 bytes
+	})
+
+	err = conn.SendToWithOptions(largePayload, validDestinationB64(), 9090, options)
+	if err == nil {
+		t.Error("SendToWithOptions() should fail when payload + options exceed max")
+	}
+	if err != nil && !strings.Contains(err.Error(), "exceeds maximum") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// TestReceiveFromWithOptions_Datagram3 tests receiving a Datagram3 with options.
+func TestReceiveFromWithOptions_Datagram3(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConnWithProtocol(session, 8080, ProtocolDatagram3)
+	if err != nil {
+		t.Fatalf("NewDatagramConnWithProtocol() failed: %v", err)
+	}
+	defer conn.Close()
+
+	payload := []byte("payload with options")
+
+	// Build Datagram3 envelope with options
+	fromHash := sha256.Sum256([]byte("sender"))
+	options := NewOptions(map[string]string{"ver": "2"})
+	optBytes, _ := options.Bytes()
+
+	envelope := make([]byte, 32+2+len(optBytes)+len(payload))
+	copy(envelope[0:32], fromHash[:])
+	envelope[32] = 0x00
+	envelope[33] = 0x13 // version 0x03 + options flag 0x10
+	copy(envelope[34:34+len(optBytes)], optBytes)
+	copy(envelope[34+len(optBytes):], payload)
+
+	// Inject the message
+	err = conn.injectMessage(envelope, nil, ProtocolDatagram3, 9090, 8080)
+	if err != nil {
+		t.Fatalf("injectMessage() failed: %v", err)
+	}
+
+	// Receive with options
+	result, err := conn.ReceiveFromWithOptions()
+	if err != nil {
+		t.Fatalf("ReceiveFromWithOptions() failed: %v", err)
+	}
+
+	// Verify payload
+	if string(result.Payload) != string(payload) {
+		t.Errorf("payload = %q, want %q", result.Payload, payload)
+	}
+
+	// Verify options were parsed
+	if result.Options == nil {
+		t.Error("expected options to be parsed, got nil")
+	} else if result.Options.Get("ver") != "2" {
+		t.Errorf("options['ver'] = %q, want %q", result.Options.Get("ver"), "2")
+	}
+
+	// Verify fromHash
+	if result.FromHash != fromHash {
+		t.Error("FromHash mismatch")
+	}
+
+	// Verify From is nil for Datagram3
+	if result.From != nil {
+		t.Error("From should be nil for Datagram3")
+	}
+}
+
+// TestReceiveFromWithOptions_Datagram3_NoOptions tests receiving Datagram3 without options.
+func TestReceiveFromWithOptions_Datagram3_NoOptions(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConnWithProtocol(session, 8080, ProtocolDatagram3)
+	if err != nil {
+		t.Fatalf("NewDatagramConnWithProtocol() failed: %v", err)
+	}
+	defer conn.Close()
+
+	payload := []byte("no options here")
+	fromHash := sha256.Sum256([]byte("sender"))
+
+	// Datagram3 without options: fromhash(32) + flags(2) + payload
+	envelope := make([]byte, 32+2+len(payload))
+	copy(envelope[0:32], fromHash[:])
+	envelope[32] = 0x00
+	envelope[33] = 0x03 // version 0x03, no options
+	copy(envelope[34:], payload)
+
+	err = conn.injectMessage(envelope, nil, ProtocolDatagram3, 9090, 8080)
+	if err != nil {
+		t.Fatalf("injectMessage() failed: %v", err)
+	}
+
+	result, err := conn.ReceiveFromWithOptions()
+	if err != nil {
+		t.Fatalf("ReceiveFromWithOptions() failed: %v", err)
+	}
+
+	// Verify payload
+	if string(result.Payload) != string(payload) {
+		t.Errorf("payload = %q, want %q", result.Payload, payload)
+	}
+
+	// Options should be nil when not present
+	if result.Options != nil {
+		t.Error("expected nil options when not present")
+	}
+}
+
+// TestReceiveFromWithOptions_Raw tests receiving Raw datagrams.
+func TestReceiveFromWithOptions_Raw(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConnWithProtocol(session, 8080, ProtocolRaw)
+	if err != nil {
+		t.Fatalf("NewDatagramConnWithProtocol() failed: %v", err)
+	}
+	defer conn.Close()
+
+	payload := []byte("raw message")
+
+	err = conn.injectMessage(payload, session.dest, ProtocolRaw, 9090, 8080)
+	if err != nil {
+		t.Fatalf("injectMessage() failed: %v", err)
+	}
+
+	result, err := conn.ReceiveFromWithOptions()
+	if err != nil {
+		t.Fatalf("ReceiveFromWithOptions() failed: %v", err)
+	}
+
+	// Verify payload
+	if string(result.Payload) != string(payload) {
+		t.Errorf("payload = %q, want %q", result.Payload, payload)
+	}
+
+	// Raw protocol doesn't support options
+	if result.Options != nil {
+		t.Error("Raw protocol should not have options")
+	}
+
+	// But should have From destination
+	if result.From == nil {
+		t.Error("expected From destination for Raw")
+	}
+}
+
+// TestReceiveFromWithOptions_ClosedConnection tests receiving on closed connection.
+func TestReceiveFromWithOptions_ClosedConnection(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConn(session, 8080)
+	if err != nil {
+		t.Fatalf("NewDatagramConn() failed: %v", err)
+	}
+	conn.Close()
+
+	_, err = conn.ReceiveFromWithOptions()
+	if err != net.ErrClosed {
+		t.Errorf("ReceiveFromWithOptions() on closed connection error = %v, want %v", err, net.ErrClosed)
+	}
+}
+
+// TestReceiveFromWithOptions_ReadDeadline tests read deadline handling.
+func TestReceiveFromWithOptions_ReadDeadline(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConn(session, 8080)
+	if err != nil {
+		t.Fatalf("NewDatagramConn() failed: %v", err)
+	}
+	defer conn.Close()
+
+	conn.SetReadDeadline(time.Now().Add(-1 * time.Second))
+
+	_, err = conn.ReceiveFromWithOptions()
+	if err == nil {
+		t.Error("ReceiveFromWithOptions() after deadline should return error")
+	}
+}
+
+// TestBuildDatagram3EnvelopeWithOptions tests the envelope builder directly.
+func TestBuildDatagram3EnvelopeWithOptions(t *testing.T) {
+	session := newMockSession()
+	payload := []byte("test payload")
+	options := NewOptions(map[string]string{"key": "value"})
+
+	envelope, err := buildDatagram3EnvelopeWithOptions(payload, session, options)
+	if err != nil {
+		t.Fatalf("buildDatagram3EnvelopeWithOptions() failed: %v", err)
+	}
+
+	// Verify structure: fromhash(32) + flags(2) + options + payload
+	if len(envelope) < 34 {
+		t.Fatalf("envelope too short: %d bytes", len(envelope))
+	}
+
+	// Flags should have options bit set
+	lowFlags := envelope[33]
+	if (lowFlags & 0x10) == 0 {
+		t.Error("options flag not set in envelope")
+	}
+	if (lowFlags & 0x0F) != 0x03 {
+		t.Errorf("version = 0x%x, want 0x03", lowFlags&0x0F)
+	}
+}
+
+// TestBuildDatagram3EnvelopeWithOptions_NilOptions tests builder with nil options.
+func TestBuildDatagram3EnvelopeWithOptions_NilOptions(t *testing.T) {
+	session := newMockSession()
+	payload := []byte("test payload")
+
+	envelope, err := buildDatagram3EnvelopeWithOptions(payload, session, nil)
+	if err != nil {
+		t.Fatalf("buildDatagram3EnvelopeWithOptions() failed: %v", err)
+	}
+
+	// Flags should NOT have options bit set
+	lowFlags := envelope[33]
+	if (lowFlags & 0x10) != 0 {
+		t.Error("options flag should not be set for nil options")
+	}
+
+	// Envelope should be exactly fromhash(32) + flags(2) + payload
+	expectedLen := 32 + 2 + len(payload)
+	if len(envelope) != expectedLen {
+		t.Errorf("envelope length = %d, want %d", len(envelope), expectedLen)
+	}
+}
+
+// TestBuildDatagram3EnvelopeWithOptions_EmptyOptions tests builder with empty options.
+func TestBuildDatagram3EnvelopeWithOptions_EmptyOptions(t *testing.T) {
+	session := newMockSession()
+	payload := []byte("test payload")
+	options := EmptyOptions()
+
+	envelope, err := buildDatagram3EnvelopeWithOptions(payload, session, options)
+	if err != nil {
+		t.Fatalf("buildDatagram3EnvelopeWithOptions() failed: %v", err)
+	}
+
+	// Empty options should not set the options flag
+	lowFlags := envelope[33]
+	if (lowFlags & 0x10) != 0 {
+		t.Error("options flag should not be set for empty options")
+	}
+}
+
+// TestReceiveResult_Fields tests the ReceiveResult struct fields.
+func TestReceiveResult_Fields(t *testing.T) {
+	result := &ReceiveResult{
+		Payload: []byte("test"),
+		SrcPort: 1234,
+	}
+
+	if string(result.Payload) != "test" {
+		t.Errorf("Payload = %q, want %q", result.Payload, "test")
+	}
+	if result.SrcPort != 1234 {
+		t.Errorf("SrcPort = %d, want %d", result.SrcPort, 1234)
 	}
 }

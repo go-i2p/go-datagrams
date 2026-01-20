@@ -211,6 +211,41 @@ type receivedDatagram struct {
 	destPort uint16
 }
 
+// ReceiveResult contains the complete result of receiving a datagram,
+// including optional fields like protocol-specific options.
+//
+// This struct is returned by [DatagramConn.ReceiveFromWithOptions] to provide
+// access to all datagram information including the options field which is
+// supported by Datagram2 (protocol 19) and Datagram3 (protocol 20).
+//
+// For protocols that don't support options (Raw, Datagram1), the Options
+// field will be nil.
+type ReceiveResult struct {
+	// Payload is the application data extracted from the datagram.
+	Payload []byte
+
+	// From is the sender's full I2P destination for authenticated protocols.
+	// For Datagram3 (protocol 20), this is nil because only the sender's hash
+	// is available. Use FromHash or FromAddr.DestinationHash instead.
+	From *i2cp.Destination
+
+	// FromHash is the SHA-256 hash of the sender's destination.
+	// Available for Datagram3 and computed from From for other protocols.
+	FromHash [32]byte
+
+	// FromAddr is the sender address as an I2PAddr for net.Addr compatibility.
+	FromAddr *I2PAddr
+
+	// SrcPort is the source port from the datagram header.
+	SrcPort uint16
+
+	// Options contains the I2P Mapping options if present in the datagram.
+	// Only Datagram2 (19) and Datagram3 (20) support options.
+	// This is nil for protocols that don't support options or when no options
+	// were included in the received datagram.
+	Options *Options
+}
+
 // NewDatagramConn creates a new DatagramConn bound to the specified local port.
 // The connection uses ProtocolRaw (18) by default for zero overhead.
 //
@@ -613,6 +648,136 @@ func (d *DatagramConn) SendTo(payload []byte, destinationB64 string, port uint16
 	return nil
 }
 
+// SendToWithOptions sends a datagram with optional I2P Mapping options.
+//
+// This method extends [DatagramConn.SendTo] by allowing the inclusion of options
+// in the datagram envelope. Options are only supported by Datagram2 (protocol 19)
+// and Datagram3 (protocol 20). For other protocols, the options parameter is ignored.
+//
+// Options can contain arbitrary key/value pairs encoded as an I2P Mapping structure.
+// Common use cases include application-specific metadata, routing hints, or version info.
+//
+// The options parameter may be nil or empty to send a datagram without options
+// (equivalent to calling [DatagramConn.SendTo]).
+//
+// Example:
+//
+//	opts := datagrams.NewOptions(map[string]string{
+//	    "version": "1.0",
+//	    "app": "myapp",
+//	})
+//	err := conn.SendToWithOptions(payload, destB64, port, opts)
+//
+// Returns an error if:
+//   - The connection is closed
+//   - The payload exceeds the maximum size for the protocol type
+//   - The destination string is invalid
+//   - The write deadline has expired
+//   - The underlying I2CP session fails to send
+func (d *DatagramConn) SendToWithOptions(payload []byte, destinationB64 string, port uint16, options *Options) error {
+	d.mu.RLock()
+	closed := d.closed
+	deadline := d.writeDeadline
+	protocol := d.protocol
+	session := d.session
+	localPort := d.localPort
+	d.mu.RUnlock()
+
+	if closed {
+		return net.ErrClosed
+	}
+
+	// Calculate max payload accounting for options overhead
+	maxSize := d.MaxPayloadSize()
+	optionsOverhead := 0
+	if options != nil && !options.IsEmpty() {
+		optionsOverhead = options.Len()
+	}
+	effectiveMax := maxSize - optionsOverhead
+	if effectiveMax < 0 {
+		return fmt.Errorf("options too large: %d bytes, maximum payload %d", optionsOverhead, maxSize)
+	}
+	if len(payload) > effectiveMax {
+		return fmt.Errorf("payload size %d exceeds maximum %d for protocol %d with options (%d bytes)", len(payload), effectiveMax, protocol, optionsOverhead)
+	}
+
+	// Check write deadline
+	if !deadline.IsZero() && time.Now().After(deadline) {
+		return fmt.Errorf("write deadline exceeded")
+	}
+
+	// Parse destination from base64 string
+	crypto := i2cp.NewCrypto()
+	dest, err := i2cp.NewDestinationFromBase64(destinationB64, crypto)
+	if err != nil {
+		return fmt.Errorf("invalid destination: %w", err)
+	}
+
+	// Construct protocol-specific envelope
+	var envelope []byte
+	switch protocol {
+	case ProtocolRaw:
+		// Raw datagrams don't support options, send payload directly
+		envelope = payload
+
+	case ProtocolDatagram3:
+		// Datagram3: fromhash(32) + flags(2) + [options] + payload
+		var buildErr error
+		envelope, buildErr = buildDatagram3EnvelopeWithOptions(payload, session, options)
+		if buildErr != nil {
+			return fmt.Errorf("failed to build Datagram3 envelope: %w", buildErr)
+		}
+
+	case ProtocolDatagram1:
+		// Datagram1 doesn't support options
+		var buildErr error
+		envelope, buildErr = buildDatagram1Envelope(payload, session)
+		if buildErr != nil {
+			return fmt.Errorf("failed to build Datagram1 envelope: %w", buildErr)
+		}
+
+	case ProtocolDatagram2:
+		// Datagram2: from dest(387+) + flags(2) + [options] + [offline_sig] + payload + signature(40+)
+		targetDestStream := i2cp.NewStream(nil)
+		if err := dest.WriteToStream(targetDestStream); err != nil {
+			return fmt.Errorf("failed to serialize target destination: %w", err)
+		}
+		targetDestHash := sha256.Sum256(targetDestStream.Bytes())
+
+		var buildErr error
+		envelope, buildErr = buildDatagram2EnvelopeWithOptions(payload, session, targetDestHash, options)
+		if buildErr != nil {
+			return fmt.Errorf("failed to build Datagram2 envelope: %w", buildErr)
+		}
+
+	default:
+		return fmt.Errorf("unsupported protocol: %d", protocol)
+	}
+
+	// Send via I2CP
+	stream := i2cp.NewStream(envelope)
+
+	// Use context with timeout if write deadline is set
+	if !deadline.IsZero() {
+		timeout := time.Until(deadline)
+		if timeout <= 0 {
+			return fmt.Errorf("write deadline exceeded")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+
+		err = session.SendMessageWithContext(ctx, dest, protocol, localPort, port, stream, 0)
+	} else {
+		err = session.SendMessage(dest, protocol, localPort, port, stream, 0)
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to send datagram: %w", err)
+	}
+
+	return nil
+}
+
 // ReceiveFrom receives a datagram and returns the payload, sender destination, and source port.
 //
 // This method blocks until a datagram is received or an error occurs. It respects the
@@ -732,6 +897,76 @@ func (d *DatagramConn) ReceiveFromWithAddr() ([]byte, *I2PAddr, error) {
 
 	case <-d.ctx.Done():
 		return nil, nil, net.ErrClosed
+	}
+}
+
+// ReceiveFromWithOptions receives a datagram and returns a ReceiveResult containing
+// the payload, sender information, and parsed options.
+//
+// This method provides complete access to all datagram fields, including the options
+// field which is supported by Datagram2 (protocol 19) and Datagram3 (protocol 20).
+//
+// For protocols that don't support options (Raw, Datagram1), the Options field in the
+// result will be nil. For protocols that support options but didn't include any in the
+// received datagram, the Options field will also be nil.
+//
+// For Datagram3 (protocol 20), the From field in the result will be nil because only
+// the sender's hash is available. Use FromHash or FromAddr.DestinationHash instead.
+//
+// This method blocks until a datagram is received or an error occurs. It respects the
+// read deadline set by SetReadDeadline() or SetDeadline().
+//
+// Example:
+//
+//	result, err := conn.ReceiveFromWithOptions()
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	if result.Options != nil {
+//	    version := result.Options.Get("version")
+//	    log.Printf("Received from peer with version: %s", version)
+//	}
+//
+// Returns an error if:
+//   - The connection is closed
+//   - The read deadline has expired
+//   - The envelope is malformed
+//   - Signature verification fails (Datagram1/2)
+func (d *DatagramConn) ReceiveFromWithOptions() (*ReceiveResult, error) {
+	d.mu.RLock()
+	closed := d.closed
+	deadline := d.readDeadline
+	protocol := d.protocol
+	d.mu.RUnlock()
+
+	if closed {
+		return nil, net.ErrClosed
+	}
+
+	// Set up deadline timeout if specified
+	var timer *time.Timer
+	var timeoutChan <-chan time.Time
+	if !deadline.IsZero() {
+		timeout := time.Until(deadline)
+		if timeout <= 0 {
+			return nil, fmt.Errorf("read deadline exceeded")
+		}
+		timer = time.NewTimer(timeout)
+		defer timer.Stop()
+		timeoutChan = timer.C
+	}
+
+	// Block until message received, deadline, or context cancelled
+	select {
+	case msg := <-d.recvQueue:
+		// Parse protocol-specific envelope with options
+		return d.parseEnvelopeWithOptions(msg, protocol)
+
+	case <-timeoutChan:
+		return nil, fmt.Errorf("read deadline exceeded")
+
+	case <-d.ctx.Done():
+		return nil, net.ErrClosed
 	}
 }
 
@@ -951,6 +1186,131 @@ func (d *DatagramConn) parseEnvelopeToAddr(msg *receivedDatagram, protocol uint8
 	}
 }
 
+// parseEnvelopeWithOptions extracts all datagram fields including options.
+// This method returns a complete ReceiveResult with all available information.
+func (d *DatagramConn) parseEnvelopeWithOptions(msg *receivedDatagram, protocol uint8) (*ReceiveResult, error) {
+	result := &ReceiveResult{
+		SrcPort: msg.srcPort,
+	}
+
+	switch protocol {
+	case ProtocolRaw:
+		// Raw datagrams have no envelope, payload is direct, no options
+		result.Payload = msg.payload
+		result.From = msg.from
+		if msg.from != nil {
+			result.FromAddr = &I2PAddr{
+				Destination: msg.from.Base64(),
+				Port:        msg.srcPort,
+			}
+			// Compute hash from destination
+			destStream := i2cp.NewStream(nil)
+			if err := msg.from.WriteToStream(destStream); err == nil {
+				result.FromHash = sha256.Sum256(destStream.Bytes())
+				result.FromAddr.DestinationHash = result.FromHash
+			}
+		}
+		return result, nil
+
+	case ProtocolDatagram3:
+		// Datagram3: fromhash(32) + flags(2) + [options] + payload
+		if len(msg.payload) < 34 {
+			return nil, fmt.Errorf("Datagram3 envelope too short: %d bytes, need at least 34", len(msg.payload))
+		}
+
+		// Extract fromhash (first 32 bytes)
+		copy(result.FromHash[:], msg.payload[0:32])
+
+		// Extract flags
+		highFlags := msg.payload[32]
+		lowFlags := msg.payload[33]
+
+		// Validate reserved bits (5-15) are zero
+		reservedMask := uint16(0xFFE0)
+		flagsValue := uint16(highFlags)<<8 | uint16(lowFlags)
+		if flagsValue&reservedMask != 0 {
+			return nil, fmt.Errorf("Datagram3 has non-zero reserved flag bits: 0x%04x", flagsValue)
+		}
+
+		version := lowFlags & 0x0F
+		hasOptions := (lowFlags & 0x10) != 0
+
+		if version != 0x03 {
+			return nil, fmt.Errorf("invalid Datagram3 version: 0x%x (expected 0x03)", version)
+		}
+
+		offset := 34
+
+		// Parse options if present
+		if hasOptions {
+			if len(msg.payload)-offset < 2 {
+				return nil, fmt.Errorf("Datagram3 envelope too short for options at offset %d", offset)
+			}
+			opts, optLen, optErr := OptionsFromBytes(msg.payload[offset:])
+			if optErr != nil {
+				return nil, fmt.Errorf("Datagram3 failed to parse options: %w", optErr)
+			}
+			offset += optLen
+			result.Options = opts
+		}
+
+		result.Payload = msg.payload[offset:]
+		result.From = nil // Datagram3 only has hash, not full destination
+		result.FromAddr = &I2PAddr{
+			Destination:     "",
+			DestinationHash: result.FromHash,
+			Port:            msg.srcPort,
+		}
+		return result, nil
+
+	case ProtocolDatagram1:
+		// Datagram1 doesn't support options
+		payload, from, err := parseDatagram1Envelope(msg.payload, d.session)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse Datagram1 envelope: %w", err)
+		}
+		result.Payload = payload
+		result.From = from
+		if from != nil {
+			result.FromAddr = &I2PAddr{
+				Destination: from.Base64(),
+				Port:        msg.srcPort,
+			}
+			destStream := i2cp.NewStream(nil)
+			if err := from.WriteToStream(destStream); err == nil {
+				result.FromHash = sha256.Sum256(destStream.Bytes())
+				result.FromAddr.DestinationHash = result.FromHash
+			}
+		}
+		return result, nil
+
+	case ProtocolDatagram2:
+		// Datagram2: parse with options support
+		payload, from, opts, err := parseDatagram2EnvelopeWithOptions(msg.payload, d.session)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse Datagram2 envelope: %w", err)
+		}
+		result.Payload = payload
+		result.From = from
+		result.Options = opts
+		if from != nil {
+			result.FromAddr = &I2PAddr{
+				Destination: from.Base64(),
+				Port:        msg.srcPort,
+			}
+			destStream := i2cp.NewStream(nil)
+			if err := from.WriteToStream(destStream); err == nil {
+				result.FromHash = sha256.Sum256(destStream.Bytes())
+				result.FromAddr.DestinationHash = result.FromHash
+			}
+		}
+		return result, nil
+
+	default:
+		return nil, fmt.Errorf("unsupported protocol for receive: %d", protocol)
+	}
+}
+
 // buildDatagram1Envelope constructs a Datagram1 envelope with signature.
 // Format: from destination (391+ bytes wire format) + signature (64 bytes for Ed25519) + payload
 //
@@ -1071,7 +1431,22 @@ func buildDatagram2Envelope(payload []byte, session I2CPSession, targetDestHash 
 
 // buildDatagram2EnvelopeWithOptions constructs a Datagram2 envelope with optional options field.
 // Options may be nil or empty to omit the options field.
+//
+// NOTE: Datagram2 is designed to support offline signatures (LS2 offline keys), but this
+// implementation does not yet support SENDING with offline signatures. The go-i2cp library
+// would need to expose the transient signing key for this to be implemented.
+// Receiving Datagram2 with offline signatures IS supported.
 func buildDatagram2EnvelopeWithOptions(payload []byte, session I2CPSession, targetDestHash [32]byte, options *Options) ([]byte, error) {
+	// Per I2P specification, Datagram2 supports offline signatures (unlike Datagram1 which does not).
+	// However, this implementation cannot currently construct the offline signature block for
+	// SENDING because go-i2cp does not expose the transient signing key.
+	// Receiving/parsing offline signatures IS implemented.
+	// See: https://geti2p.net/spec/datagrams#datagram2
+	if session.IsOffline() {
+		return nil, fmt.Errorf("Datagram2 sending with offline signatures (LS2 offline keys) is not yet supported; " +
+			"go-i2cp would need to expose the transient signing key for this feature")
+	}
+
 	// Get the session's signing key pair
 	keyPair, err := session.SigningKeyPair()
 	if err != nil {
@@ -1153,6 +1528,59 @@ func buildDatagram2EnvelopeWithOptions(payload []byte, session I2CPSession, targ
 	return envelope, nil
 }
 
+// buildDatagram3EnvelopeWithOptions constructs a Datagram3 envelope with optional options field.
+// Format: fromhash(32) + flags(2) + [options] + payload
+//
+// Unlike Datagram2, Datagram3 is NOT signed - it only includes the sender's hash for repliability.
+// This makes it lightweight but unauthenticated.
+//
+// Options may be nil or empty to omit the options field.
+func buildDatagram3EnvelopeWithOptions(payload []byte, session I2CPSession, options *Options) ([]byte, error) {
+	localDest := session.Destination()
+	if localDest == nil {
+		return nil, fmt.Errorf("session has no destination")
+	}
+
+	// Compute SHA-256 hash of the local destination
+	destStream := i2cp.NewStream(nil)
+	if err := localDest.WriteToStream(destStream); err != nil {
+		return nil, fmt.Errorf("failed to serialize destination: %w", err)
+	}
+	fromHash := sha256.Sum256(destStream.Bytes())
+
+	// Build flags (2 bytes): version 0x03, options flag if options present
+	// Bit order: 15 14 ... 3 2 1 0
+	// Bits 3-0: Version = 0x03
+	// Bit 4: Options flag = 1 if options present
+	// Bits 5-15: Reserved (must be 0)
+	lowFlags := byte(0x03) // version 0x03
+	var optionsBytes []byte
+	if options != nil && !options.IsEmpty() {
+		lowFlags |= 0x10 // set options flag
+		var optErr error
+		optionsBytes, optErr = options.Bytes()
+		if optErr != nil {
+			return nil, fmt.Errorf("failed to serialize options: %w", optErr)
+		}
+	}
+
+	// Build envelope: fromhash + flags + [options] + payload
+	envelope := make([]byte, 32+2+len(optionsBytes)+len(payload))
+	offset := 0
+	copy(envelope[offset:], fromHash[:])
+	offset += 32
+	envelope[offset] = 0x00 // high byte = 0 (reserved)
+	envelope[offset+1] = lowFlags
+	offset += 2
+	if len(optionsBytes) > 0 {
+		copy(envelope[offset:], optionsBytes)
+		offset += len(optionsBytes)
+	}
+	copy(envelope[offset:], payload)
+
+	return envelope, nil
+}
+
 // parseDatagram2Envelope extracts and verifies a Datagram2 envelope with replay prevention.
 // Format: from destination (391+ bytes wire format) + flags (2 bytes) + [options] + [offline_sig] + payload + signature (64 bytes)
 //
@@ -1165,9 +1593,21 @@ func buildDatagram2EnvelopeWithOptions(payload []byte, session I2CPSession, targ
 //
 // Returns the payload, from destination, and any error (including signature verification failure).
 func parseDatagram2Envelope(data []byte, session I2CPSession) (payload []byte, from *i2cp.Destination, err error) {
+	payload, from, _, err = parseDatagram2EnvelopeWithOptions(data, session)
+	return payload, from, err
+}
+
+// parseDatagram2EnvelopeWithOptions extracts and verifies a Datagram2 envelope, returning options.
+// Format: from destination (391+ bytes wire format) + flags (2 bytes) + [options] + [offline_sig] + payload + signature (64 bytes)
+//
+// The signature must verify against: receiver_dest_hash + flags + options + offline_sig + payload
+// This provides replay prevention - datagrams sent to different destinations will fail verification.
+//
+// Returns the payload, from destination, parsed options (if present), and any error.
+func parseDatagram2EnvelopeWithOptions(data []byte, session I2CPSession) (payload []byte, from *i2cp.Destination, options *Options, err error) {
 	// Minimum size: MinDatagram2Overhead = Ed25519DestinationSize (391) + flags (2) + Ed25519SignatureLength (64) = 457 bytes
 	if len(data) < MinDatagram2Overhead {
-		return nil, nil, fmt.Errorf("Datagram2 envelope too short: %d bytes (need at least %d)", len(data), MinDatagram2Overhead)
+		return nil, nil, nil, fmt.Errorf("Datagram2 envelope too short: %d bytes (need at least %d)", len(data), MinDatagram2Overhead)
 	}
 
 	// Parse destination from the envelope using wire format reader
@@ -1175,19 +1615,19 @@ func parseDatagram2Envelope(data []byte, session I2CPSession) (payload []byte, f
 	stream := i2cp.NewStream(data)
 	from, err = i2cp.NewDestinationFromMessage(stream, crypto)
 	if err != nil {
-		return nil, nil, fmt.Errorf("Datagram2 failed to parse destination: %w", err)
+		return nil, nil, nil, fmt.Errorf("Datagram2 failed to parse destination: %w", err)
 	}
 
 	// Calculate how many bytes were consumed by the destination (wire format)
 	destStream := i2cp.NewStream(nil)
 	if err := from.WriteToMessage(destStream); err != nil {
-		return nil, nil, fmt.Errorf("Datagram2 failed to serialize destination: %w", err)
+		return nil, nil, nil, fmt.Errorf("Datagram2 failed to serialize destination: %w", err)
 	}
 	destLen := destStream.Len()
 
 	// Check minimum remaining size for flags + signature
 	if len(data) < destLen+2+Ed25519SignatureLength {
-		return nil, nil, fmt.Errorf("Datagram2 envelope too short after destination: have %d bytes remaining, need at least %d (flags: 2, signature: %d)", len(data)-destLen, 2+Ed25519SignatureLength, Ed25519SignatureLength)
+		return nil, nil, nil, fmt.Errorf("Datagram2 envelope too short after destination: have %d bytes remaining, need at least %d (flags: 2, signature: %d)", len(data)-destLen, 2+Ed25519SignatureLength, Ed25519SignatureLength)
 	}
 
 	// Extract flags (2 bytes) per I2P Datagram specification
@@ -1205,13 +1645,13 @@ func parseDatagram2Envelope(data []byte, session I2CPSession) (payload []byte, f
 	reservedMask := uint16(0xFFC0) // bits 6-15
 	flagsValue := uint16(flags[0])<<8 | uint16(flags[1])
 	if flagsValue&reservedMask != 0 {
-		return nil, nil, fmt.Errorf("Datagram2 has non-zero reserved flag bits: 0x%04x (reserved bits: 0x%04x)", flagsValue, flagsValue&reservedMask)
+		return nil, nil, nil, fmt.Errorf("Datagram2 has non-zero reserved flag bits: 0x%04x (reserved bits: 0x%04x)", flagsValue, flagsValue&reservedMask)
 	}
 
 	// Parse flags - version is in low byte (bits 0-3)
 	version := flags[1] & 0x0F
 	if version != 0x02 {
-		return nil, nil, fmt.Errorf("invalid Datagram2 version: 0x%02x (expected 0x02)", version)
+		return nil, nil, nil, fmt.Errorf("invalid Datagram2 version: 0x%02x (expected 0x02)", version)
 	}
 
 	hasOptions := (flags[1] & 0x10) != 0    // Bit 4: HEADER_OPTIONS
@@ -1226,17 +1666,17 @@ func parseDatagram2Envelope(data []byte, session I2CPSession) (payload []byte, f
 	// Parse options if present (I2P Mapping format: 2-byte size + key=value; pairs)
 	if hasOptions {
 		if len(data)-offset < 2 {
-			return nil, nil, fmt.Errorf("Datagram2 envelope too short for options size field at offset %d: have %d bytes, need at least 2", offset, len(data)-offset)
+			return nil, nil, nil, fmt.Errorf("Datagram2 envelope too short for options size field at offset %d: have %d bytes, need at least 2", offset, len(data)-offset)
 		}
 		opts, optLen, optErr := OptionsFromBytes(data[offset:])
 		if optErr != nil {
-			return nil, nil, fmt.Errorf("Datagram2 failed to parse options: %w", optErr)
+			return nil, nil, nil, fmt.Errorf("Datagram2 failed to parse options: %w", optErr)
 		}
 		// Store the raw options bytes for signature verification
 		optionsBytes = data[offset : offset+optLen]
 		offset += optLen
-		// Options are parsed but not exposed in return value (could be added later)
-		_ = opts
+		// Return parsed options to caller
+		options = opts
 	}
 
 	// Parse offline signature if present
@@ -1251,18 +1691,18 @@ func parseDatagram2Envelope(data []byte, session I2CPSession) (payload []byte, f
 		var offErr error
 		offlineSig, offLen, offErr = OfflineSignatureFromBytes(data[offset:], destSigType)
 		if offErr != nil {
-			return nil, nil, fmt.Errorf("Datagram2 failed to parse offline signature: %w", offErr)
+			return nil, nil, nil, fmt.Errorf("Datagram2 failed to parse offline signature: %w", offErr)
 		}
 
 		// Check if the offline signature has expired
 		if offlineSig.IsExpired() {
-			return nil, nil, fmt.Errorf("Datagram2 offline signature has expired (expired at %s)", offlineSig.Expires)
+			return nil, nil, nil, fmt.Errorf("Datagram2 offline signature has expired (expired at %s)", offlineSig.Expires)
 		}
 
 		// Verify the offline signature against the sender's destination key
 		// This proves the destination authorized the transient key to sign on its behalf
 		if verifyErr := offlineSig.Verify(from); verifyErr != nil {
-			return nil, nil, fmt.Errorf("Datagram2 offline signature authorization failed: %w", verifyErr)
+			return nil, nil, nil, fmt.Errorf("Datagram2 offline signature authorization failed: %w", verifyErr)
 		}
 
 		// Store the raw offline signature bytes for signature verification
@@ -1273,7 +1713,7 @@ func parseDatagram2Envelope(data []byte, session I2CPSession) (payload []byte, f
 	// Remaining data: payload + signature
 	// Ed25519 signature is always 64 bytes and is at the END
 	if len(data)-offset < Ed25519SignatureLength {
-		return nil, nil, fmt.Errorf("Datagram2 envelope too short for signature at offset %d: have %d bytes, need %d", offset, len(data)-offset, Ed25519SignatureLength)
+		return nil, nil, nil, fmt.Errorf("Datagram2 envelope too short for signature at offset %d: have %d bytes, need %d", offset, len(data)-offset, Ed25519SignatureLength)
 	}
 
 	// Split payload and signature (signature is at end)
@@ -1285,13 +1725,15 @@ func parseDatagram2Envelope(data []byte, session I2CPSession) (payload []byte, f
 	// Per spec: "The 32-byte hash of the target destination (not included in the datagram)"
 	localDest := session.Destination()
 	if localDest == nil {
-		return nil, nil, fmt.Errorf("session has no destination for verification")
+		return nil, nil, nil, fmt.Errorf("session has no destination for verification")
 	}
 
 	// Hash the wire format of our destination to get the target hash
+	// Uses WriteToStream for consistency with hash computation in send path (buildDatagram2EnvelopeWithOptions
+	// and buildDatagram3EnvelopeWithOptions both use WriteToStream for hash computation)
 	localDestStream := i2cp.NewStream(nil)
-	if err := localDest.WriteToMessage(localDestStream); err != nil {
-		return nil, nil, fmt.Errorf("Datagram2 failed to serialize local destination: %w", err)
+	if err := localDest.WriteToStream(localDestStream); err != nil {
+		return nil, nil, nil, fmt.Errorf("Datagram2 failed to serialize local destination: %w", err)
 	}
 	localDestHash := sha256.Sum256(localDestStream.Bytes())
 
@@ -1328,10 +1770,10 @@ func parseDatagram2Envelope(data []byte, session I2CPSession) (payload []byte, f
 	}
 
 	if !signatureValid {
-		return nil, nil, fmt.Errorf("Datagram2 signature verification failed (possible replay attack or wrong recipient)")
+		return nil, nil, nil, fmt.Errorf("Datagram2 signature verification failed (possible replay attack or wrong recipient)")
 	}
 
-	return payload, from, nil
+	return payload, from, options, nil
 }
 
 // ReadFrom reads a packet from the connection, copying the payload into p.
