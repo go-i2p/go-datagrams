@@ -6,14 +6,14 @@ toolchain go1.24.12
 
 require (
 	github.com/go-i2p/common v0.1.2
-	github.com/go-i2p/go-i2cp v0.1.1
+	github.com/go-i2p/go-i2cp v0.1.2
 )
 
 require (
 	filippo.io/edwards25519 v1.1.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/go-i2p/crypto v0.1.1 // indirect
-	github.com/go-i2p/logger v0.1.1 // indirect
+	github.com/go-i2p/crypto v0.1.3 // indirect
+	github.com/go-i2p/logger v0.1.2 // indirect
 	github.com/oklog/ulid/v2 v2.1.1 // indirect
 	github.com/samber/lo v1.52.0 // indirect
 	github.com/samber/oops v1.21.0 // indirect
