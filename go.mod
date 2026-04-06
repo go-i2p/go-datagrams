@@ -1,27 +1,25 @@
 module github.com/go-i2p/go-datagrams
 
-go 1.24.5
-
-toolchain go1.24.12
+go 1.25.0
 
 require (
-	github.com/go-i2p/common v0.1.2
+	github.com/go-i2p/common v0.1.4-0.20260402231221-af2f599a75cd
 	github.com/go-i2p/go-i2cp v0.1.2
 )
 
 require (
-	filippo.io/edwards25519 v1.1.0 // indirect
+	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/go-i2p/crypto v0.1.3 // indirect
-	github.com/go-i2p/logger v0.1.2 // indirect
+	github.com/go-i2p/crypto v0.1.4-0.20260327201310-96101c044a62 // indirect
+	github.com/go-i2p/logger v0.1.5 // indirect
 	github.com/oklog/ulid/v2 v2.1.1 // indirect
-	github.com/samber/lo v1.52.0 // indirect
+	github.com/samber/lo v1.53.0 // indirect
 	github.com/samber/oops v1.21.0 // indirect
 	github.com/sirupsen/logrus v1.9.4 // indirect
-	go.opentelemetry.io/otel v1.39.0 // indirect
-	go.opentelemetry.io/otel/trace v1.39.0 // indirect
+	go.opentelemetry.io/otel v1.42.0 // indirect
+	go.opentelemetry.io/otel/trace v1.42.0 // indirect
 	go.step.sm/crypto v0.76.0 // indirect
-	golang.org/x/crypto v0.47.0 // indirect
-	golang.org/x/sys v0.40.0 // indirect
-	golang.org/x/text v0.33.0 // indirect
+	golang.org/x/crypto v0.49.0 // indirect
+	golang.org/x/sys v0.42.0 // indirect
+	golang.org/x/text v0.35.0 // indirect
 )
