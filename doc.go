@@ -10,10 +10,10 @@
 //   - Raw (Protocol 18): Non-repliable, no authentication, 0 bytes overhead
 //     Use for: Performance-critical applications with trusted peers
 //
-//   - Datagram1 (Protocol 17): Repliable, authenticated, ~427 bytes overhead (legacy)
+//   - Datagram1 (Protocol 17): Repliable, authenticated, ~455 bytes overhead (Ed25519)
 //     Use for: Legacy compatibility with older I2P applications
 //
-//   - Datagram2 (Protocol 19): Repliable, authenticated with replay prevention, ~433+ bytes overhead
+//   - Datagram2 (Protocol 19): Repliable, authenticated with replay prevention, ~457+ bytes overhead (Ed25519)
 //     Use for: Modern authenticated messaging requiring replay attack prevention
 //
 //   - Datagram3 (Protocol 20): Repliable, no authentication, ~34 bytes overhead
@@ -21,7 +21,7 @@
 //
 // # Size Limits
 //
-// The practical size limit for reliable delivery is 8-10KB. While I2CP supports up to ~31KB datagrams,
+// The practical size limit for reliable delivery is 8-10KB. While I2CP supports up to ~64KB datagrams,
 // larger messages are fragmented into 1KB tunnel messages with exponentially increasing drop probability.
 //
 // # Stateless Design

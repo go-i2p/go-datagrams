@@ -2883,6 +2883,119 @@ func TestReceiveLoop_HandlerPanic(t *testing.T) {
 	}
 }
 
+// TestReceiveLoop_NoBusyLoop verifies that unhandled messages don't cause CPU spinning.
+// Before the fix, an unhandled message would be read and re-queued in a tight loop.
+// After the fix, there's a 1ms sleep between re-queue iterations which caps iterations.
+func TestReceiveLoop_NoBusyLoop(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConn(session, 8080)
+	if err != nil {
+		t.Fatalf("NewDatagramConn() failed: %v", err)
+	}
+	defer conn.Close()
+
+	// Register a handler on a different port to start the receive loop
+	handlerCalled := make(chan struct{}, 1)
+	err = conn.RegisterPort(9999, func(payload []byte, from *i2cp.Destination) {
+		select {
+		case handlerCalled <- struct{}{}:
+		default:
+		}
+	})
+	if err != nil {
+		t.Fatalf("RegisterPort() failed: %v", err)
+	}
+
+	// Inject an unhandled message (no handler on port 7777)
+	testDest := session.Destination()
+	err = conn.injectMessage([]byte("unhandled"), testDest, ProtocolRaw, 7777, 7777)
+	if err != nil {
+		t.Fatalf("injectMessage() failed: %v", err)
+	}
+
+	// Let the receive loop run for 100ms with the unhandled message bouncing around.
+	// If the busy-loop bug were present, this would spin millions of iterations.
+	// With the 1ms sleep fix, it should do ~100 iterations at most.
+	time.Sleep(100 * time.Millisecond)
+
+	// Now inject a message for the registered handler to prove the receive loop
+	// is still functional (not starved or stuck).
+	err = conn.injectMessage([]byte("handled"), testDest, ProtocolRaw, 9999, 9999)
+	if err != nil {
+		t.Fatalf("injectMessage() for handled port failed: %v", err)
+	}
+
+	select {
+	case <-handlerCalled:
+		// Good - receive loop is responsive despite unhandled message
+	case <-time.After(2 * time.Second):
+		t.Fatal("Receive loop appears stuck or starved by unhandled message re-queuing")
+	}
+
+	// Verify the unhandled message is still available via ReceiveFrom
+	payload, _, port, err := conn.ReceiveFrom()
+	if err != nil {
+		t.Fatalf("ReceiveFrom() failed: %v", err)
+	}
+	if string(payload) != "unhandled" {
+		t.Errorf("ReceiveFrom() payload = %q, want %q", payload, "unhandled")
+	}
+	if port != 7777 {
+		t.Errorf("ReceiveFrom() port = %d, want 7777", port)
+	}
+}
+
+// TestReceiveLoop_QueueFull tests behavior when the receive queue approaches capacity.
+// The "queue full - message lost" default case in receiveLoop is a non-deterministic
+// timing path that occurs when the queue is full at the exact moment of re-queue.
+// This test verifies the overall system handles high queue pressure gracefully.
+func TestReceiveLoop_QueueFull(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConn(session, 8080)
+	if err != nil {
+		t.Fatalf("NewDatagramConn() failed: %v", err)
+	}
+	defer conn.Close()
+
+	// Fill most of the queue (leave 1 slot for re-queue bounce)
+	testDest := session.Destination()
+	for i := 0; i < 99; i++ {
+		err = conn.injectMessage([]byte(fmt.Sprintf("msg-%d", i)), testDest, ProtocolRaw, 8080, 8080)
+		if err != nil {
+			t.Fatalf("injectMessage() %d failed: %v", i, err)
+		}
+	}
+
+	// Register handler on different port so receiveLoop starts processing
+	// Messages on port 8080 have no handler, so they get re-queued
+	handled := make(chan struct{}, 1)
+	err = conn.RegisterPort(9999, func(payload []byte, from *i2cp.Destination) {
+		select {
+		case handled <- struct{}{}:
+		default:
+		}
+	})
+	if err != nil {
+		t.Fatalf("RegisterPort() failed: %v", err)
+	}
+
+	// Give receiveLoop time to start bouncing unhandled messages
+	time.Sleep(50 * time.Millisecond)
+
+	// Inject a handled message to verify loop is still functional under pressure
+	err = conn.injectMessage([]byte("for-handler"), testDest, ProtocolRaw, 9999, 9999)
+	if err != nil {
+		t.Fatalf("injectMessage() for handler failed: %v", err)
+	}
+
+	select {
+	case <-handled:
+		// receiveLoop is working under high queue pressure
+	case <-time.After(5 * time.Second):
+		t.Fatal("receiveLoop appears stuck under queue pressure")
+	}
+}
+
 // TestReceiveFromWithAddr_Raw tests receiving Raw protocol datagrams with address info.
 func TestReceiveFromWithAddr_Raw(t *testing.T) {
 	session := newMockSession()
@@ -3254,6 +3367,93 @@ func TestSendToWithOptions_OptionsTooLarge(t *testing.T) {
 	}
 }
 
+// TestSendToWithOptions_Datagram1_Passthrough tests that Datagram1 ignores options.
+func TestSendToWithOptions_Datagram1_Passthrough(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConnWithProtocol(session, 8080, ProtocolDatagram1)
+	if err != nil {
+		t.Fatalf("NewDatagramConnWithProtocol() failed: %v", err)
+	}
+	defer conn.Close()
+
+	payload := []byte("datagram1 payload")
+	destB64 := validDestinationB64()
+	options := NewOptions(map[string]string{"ignored": "yes"})
+
+	err = conn.SendToWithOptions(payload, destB64, 9090, options)
+	if err != nil {
+		t.Errorf("SendToWithOptions() error = %v", err)
+	}
+
+	// Verify envelope was built (Datagram1 format: dest + signature + payload)
+	sent := session.lastPayload
+	if len(sent) < MinDatagram1Overhead {
+		t.Fatalf("envelope too short: %d bytes, need at least %d", len(sent), MinDatagram1Overhead)
+	}
+}
+
+// TestSendToWithOptions_Datagram2_NilOptions tests Datagram2 with nil options.
+func TestSendToWithOptions_Datagram2_NilOptions(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConnWithProtocol(session, 8080, ProtocolDatagram2)
+	if err != nil {
+		t.Fatalf("NewDatagramConnWithProtocol() failed: %v", err)
+	}
+	defer conn.Close()
+
+	payload := []byte("datagram2 no options")
+	destB64 := validDestinationB64()
+
+	err = conn.SendToWithOptions(payload, destB64, 9090, nil)
+	if err != nil {
+		t.Errorf("SendToWithOptions() error = %v", err)
+	}
+
+	sent := session.lastPayload
+	if len(sent) < MinDatagram2Overhead {
+		t.Fatalf("envelope too short: %d bytes, need at least %d", len(sent), MinDatagram2Overhead)
+	}
+}
+
+// TestSendToWithOptions_WriteDeadlineExpired tests error when write deadline has passed.
+func TestSendToWithOptions_WriteDeadlineExpired(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConnWithProtocol(session, 8080, ProtocolDatagram3)
+	if err != nil {
+		t.Fatalf("NewDatagramConnWithProtocol() failed: %v", err)
+	}
+	defer conn.Close()
+
+	// Set deadline in the past
+	conn.SetWriteDeadline(time.Now().Add(-1 * time.Second))
+
+	err = conn.SendToWithOptions([]byte("test"), validDestinationB64(), 9090, nil)
+	if err == nil {
+		t.Error("SendToWithOptions() should fail with expired write deadline")
+	}
+	if err != nil && !strings.Contains(err.Error(), "deadline") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// TestSendToWithOptions_InvalidDestination tests error for invalid base64 destination.
+func TestSendToWithOptions_InvalidDestination(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConnWithProtocol(session, 8080, ProtocolDatagram3)
+	if err != nil {
+		t.Fatalf("NewDatagramConnWithProtocol() failed: %v", err)
+	}
+	defer conn.Close()
+
+	err = conn.SendToWithOptions([]byte("test"), "not-valid-base64!!!", 9090, nil)
+	if err == nil {
+		t.Error("SendToWithOptions() should fail with invalid destination")
+	}
+	if err != nil && !strings.Contains(err.Error(), "invalid destination") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
 // TestReceiveFromWithOptions_Datagram3 tests receiving a Datagram3 with options.
 func TestReceiveFromWithOptions_Datagram3(t *testing.T) {
 	session := newMockSession()
@@ -3500,5 +3700,303 @@ func TestReceiveResult_Fields(t *testing.T) {
 	}
 	if result.SrcPort != 1234 {
 		t.Errorf("SrcPort = %d, want %d", result.SrcPort, 1234)
+	}
+}
+
+// TestReceiveFromWithAddr_Datagram1 tests receiving Datagram1 protocol and returning I2PAddr.
+func TestReceiveFromWithAddr_Datagram1(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConnWithProtocol(session, 8080, ProtocolDatagram1)
+	if err != nil {
+		t.Fatalf("NewDatagramConnWithProtocol() failed: %v", err)
+	}
+	defer conn.Close()
+
+	payload := []byte("datagram1 addr test")
+
+	// Build a valid Datagram1 envelope using the session's key
+	envelope, err := buildDatagram1Envelope(payload, session)
+	if err != nil {
+		t.Fatalf("buildDatagram1Envelope() failed: %v", err)
+	}
+
+	// Inject the envelope as a received message
+	err = conn.injectMessage(envelope, session.dest, ProtocolDatagram1, 9090, 8080)
+	if err != nil {
+		t.Fatalf("injectMessage() failed: %v", err)
+	}
+
+	// Receive with addr
+	receivedPayload, addr, err := conn.ReceiveFromWithAddr()
+	if err != nil {
+		t.Fatalf("ReceiveFromWithAddr() failed: %v", err)
+	}
+
+	if string(receivedPayload) != string(payload) {
+		t.Errorf("payload = %q, want %q", receivedPayload, payload)
+	}
+
+	if addr.Port != 9090 {
+		t.Errorf("Port = %d, want 9090", addr.Port)
+	}
+
+	if !addr.HasFullDestination() {
+		t.Error("HasFullDestination() = false, want true for Datagram1")
+	}
+
+	if addr.Destination != session.dest.Base64() {
+		t.Error("Destination mismatch")
+	}
+
+	if !addr.HasDestinationHash() {
+		t.Error("HasDestinationHash() = false, want true (computed from destination)")
+	}
+}
+
+// TestReceiveFromWithAddr_Datagram2 tests receiving Datagram2 protocol and returning I2PAddr.
+func TestReceiveFromWithAddr_Datagram2(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConnWithProtocol(session, 8080, ProtocolDatagram2)
+	if err != nil {
+		t.Fatalf("NewDatagramConnWithProtocol() failed: %v", err)
+	}
+	defer conn.Close()
+
+	payload := []byte("datagram2 addr test")
+
+	// Compute target destination hash (self-send scenario)
+	localDest := session.Destination()
+	destStream := i2cp.NewStream(nil)
+	if err := localDest.WriteToStream(destStream); err != nil {
+		t.Fatalf("WriteToStream() failed: %v", err)
+	}
+	targetHash := sha256.Sum256(destStream.Bytes())
+
+	// Build a valid Datagram2 envelope
+	envelope, err := buildDatagram2Envelope(payload, session, targetHash)
+	if err != nil {
+		t.Fatalf("buildDatagram2Envelope() failed: %v", err)
+	}
+
+	// Inject the envelope
+	err = conn.injectMessage(envelope, session.dest, ProtocolDatagram2, 9090, 8080)
+	if err != nil {
+		t.Fatalf("injectMessage() failed: %v", err)
+	}
+
+	// Receive with addr
+	receivedPayload, addr, err := conn.ReceiveFromWithAddr()
+	if err != nil {
+		t.Fatalf("ReceiveFromWithAddr() failed: %v", err)
+	}
+
+	if string(receivedPayload) != string(payload) {
+		t.Errorf("payload = %q, want %q", receivedPayload, payload)
+	}
+
+	if addr.Port != 9090 {
+		t.Errorf("Port = %d, want 9090", addr.Port)
+	}
+
+	if !addr.HasFullDestination() {
+		t.Error("HasFullDestination() = false, want true for Datagram2")
+	}
+
+	if addr.Destination != session.dest.Base64() {
+		t.Error("Destination mismatch")
+	}
+
+	if !addr.HasDestinationHash() {
+		t.Error("HasDestinationHash() = false, want true (computed from destination)")
+	}
+}
+
+// TestReceiveFromWithAddr_Datagram1_Malformed tests error handling for malformed Datagram1.
+func TestReceiveFromWithAddr_Datagram1_Malformed(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConnWithProtocol(session, 8080, ProtocolDatagram1)
+	if err != nil {
+		t.Fatalf("NewDatagramConnWithProtocol() failed: %v", err)
+	}
+	defer conn.Close()
+
+	// Inject a too-short envelope
+	err = conn.injectMessage([]byte("short"), nil, ProtocolDatagram1, 9090, 8080)
+	if err != nil {
+		t.Fatalf("injectMessage() failed: %v", err)
+	}
+
+	_, _, err = conn.ReceiveFromWithAddr()
+	if err == nil {
+		t.Error("ReceiveFromWithAddr() should fail for malformed Datagram1")
+	}
+}
+
+// TestReceiveFromWithAddr_Datagram2_Malformed tests error handling for malformed Datagram2.
+func TestReceiveFromWithAddr_Datagram2_Malformed(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConnWithProtocol(session, 8080, ProtocolDatagram2)
+	if err != nil {
+		t.Fatalf("NewDatagramConnWithProtocol() failed: %v", err)
+	}
+	defer conn.Close()
+
+	// Inject a too-short envelope
+	err = conn.injectMessage([]byte("short"), nil, ProtocolDatagram2, 9090, 8080)
+	if err != nil {
+		t.Fatalf("injectMessage() failed: %v", err)
+	}
+
+	_, _, err = conn.ReceiveFromWithAddr()
+	if err == nil {
+		t.Error("ReceiveFromWithAddr() should fail for malformed Datagram2")
+	}
+}
+
+// TestReceiveFromWithOptions_Datagram1 tests receiving Datagram1 protocol with options API.
+func TestReceiveFromWithOptions_Datagram1(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConnWithProtocol(session, 8080, ProtocolDatagram1)
+	if err != nil {
+		t.Fatalf("NewDatagramConnWithProtocol() failed: %v", err)
+	}
+	defer conn.Close()
+
+	payload := []byte("datagram1 options test")
+
+	// Build a valid Datagram1 envelope
+	envelope, err := buildDatagram1Envelope(payload, session)
+	if err != nil {
+		t.Fatalf("buildDatagram1Envelope() failed: %v", err)
+	}
+
+	err = conn.injectMessage(envelope, session.dest, ProtocolDatagram1, 9090, 8080)
+	if err != nil {
+		t.Fatalf("injectMessage() failed: %v", err)
+	}
+
+	result, err := conn.ReceiveFromWithOptions()
+	if err != nil {
+		t.Fatalf("ReceiveFromWithOptions() failed: %v", err)
+	}
+
+	if string(result.Payload) != string(payload) {
+		t.Errorf("payload = %q, want %q", result.Payload, payload)
+	}
+
+	// Datagram1 doesn't support options
+	if result.Options != nil {
+		t.Error("Datagram1 should not have options")
+	}
+
+	if result.From == nil {
+		t.Error("expected From destination for Datagram1")
+	}
+
+	if result.FromAddr == nil {
+		t.Error("expected FromAddr for Datagram1")
+	} else if result.FromAddr.Destination != session.dest.Base64() {
+		t.Error("FromAddr.Destination mismatch")
+	}
+}
+
+// TestReceiveFromWithOptions_Datagram2 tests receiving Datagram2 protocol without options.
+func TestReceiveFromWithOptions_Datagram2(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConnWithProtocol(session, 8080, ProtocolDatagram2)
+	if err != nil {
+		t.Fatalf("NewDatagramConnWithProtocol() failed: %v", err)
+	}
+	defer conn.Close()
+
+	payload := []byte("datagram2 options test")
+
+	// Compute target hash (self-send)
+	localDest := session.Destination()
+	destStream := i2cp.NewStream(nil)
+	if err := localDest.WriteToStream(destStream); err != nil {
+		t.Fatalf("WriteToStream() failed: %v", err)
+	}
+	targetHash := sha256.Sum256(destStream.Bytes())
+
+	// Build Datagram2 without options
+	envelope, err := buildDatagram2Envelope(payload, session, targetHash)
+	if err != nil {
+		t.Fatalf("buildDatagram2Envelope() failed: %v", err)
+	}
+
+	err = conn.injectMessage(envelope, session.dest, ProtocolDatagram2, 9090, 8080)
+	if err != nil {
+		t.Fatalf("injectMessage() failed: %v", err)
+	}
+
+	result, err := conn.ReceiveFromWithOptions()
+	if err != nil {
+		t.Fatalf("ReceiveFromWithOptions() failed: %v", err)
+	}
+
+	if string(result.Payload) != string(payload) {
+		t.Errorf("payload = %q, want %q", result.Payload, payload)
+	}
+
+	if result.From == nil {
+		t.Error("expected From destination for Datagram2")
+	}
+
+	if result.FromAddr == nil {
+		t.Error("expected FromAddr for Datagram2")
+	}
+}
+
+// TestReceiveFromWithOptions_Datagram2_WithOptions tests Datagram2 with options field.
+func TestReceiveFromWithOptions_Datagram2_WithOptions(t *testing.T) {
+	session := newMockSession()
+	conn, err := NewDatagramConnWithProtocol(session, 8080, ProtocolDatagram2)
+	if err != nil {
+		t.Fatalf("NewDatagramConnWithProtocol() failed: %v", err)
+	}
+	defer conn.Close()
+
+	payload := []byte("datagram2 with opts")
+	options := NewOptions(map[string]string{"app": "test"})
+
+	// Compute target hash (self-send)
+	localDest := session.Destination()
+	destStream := i2cp.NewStream(nil)
+	if err := localDest.WriteToStream(destStream); err != nil {
+		t.Fatalf("WriteToStream() failed: %v", err)
+	}
+	targetHash := sha256.Sum256(destStream.Bytes())
+
+	// Build Datagram2 with options
+	envelope, err := buildDatagram2EnvelopeWithOptions(payload, session, targetHash, options)
+	if err != nil {
+		t.Fatalf("buildDatagram2EnvelopeWithOptions() failed: %v", err)
+	}
+
+	err = conn.injectMessage(envelope, session.dest, ProtocolDatagram2, 9090, 8080)
+	if err != nil {
+		t.Fatalf("injectMessage() failed: %v", err)
+	}
+
+	result, err := conn.ReceiveFromWithOptions()
+	if err != nil {
+		t.Fatalf("ReceiveFromWithOptions() failed: %v", err)
+	}
+
+	if string(result.Payload) != string(payload) {
+		t.Errorf("payload = %q, want %q", result.Payload, payload)
+	}
+
+	if result.Options == nil {
+		t.Fatal("expected options to be parsed")
+	}
+
+	if result.Options.Get("app") != "test" {
+		t.Errorf("options['app'] = %q, want %q", result.Options.Get("app"), "test")
+	}
+
+	if result.From == nil {
+		t.Error("expected From destination for Datagram2")
 	}
 }

@@ -82,8 +82,8 @@ I2P supports multiple datagram types with different trade-offs:
 | Type | Protocol | Authenticated? | Repliable? | Overhead | Use Case |
 |------|----------|----------------|------------|----------|----------|
 | Raw | 18 | No | No | 0 bytes | Low-latency, high-throughput |
-| Datagram1 | 17 | Yes | Yes | ~427 bytes | Legacy authenticated messaging |
-| Datagram2 | 19 | Yes | Yes | ~433+ bytes | Modern authenticated with replay prevention |
+| Datagram1 | 17 | Yes | Yes | ~455 bytes | Legacy authenticated messaging |
+| Datagram2 | 19 | Yes | Yes | ~457+ bytes | Modern authenticated with replay prevention |
 | Datagram3 | 20 | No | Yes | ~34 bytes | Lightweight repliable |
 
 **Recommendation:** Use Raw datagrams for performance, Datagram3 for repliability with minimal overhead, or Datagram2 for authentication with replay protection.
@@ -123,7 +123,7 @@ if addr.HasFullDestination() {
 
 ### Size Limits
 
-- **Maximum I2CP datagram**: ~31KB (nominal 64KB minus overhead)
+- **Maximum I2CP datagram**: ~64KB (nominal)
 - **Recommended maximum**: 8-10KB for reliable delivery
 
 I2NP messages are fragmented into 1KB tunnel messages. Larger datagrams have exponentially higher drop probability due to fragmentation.
@@ -133,7 +133,7 @@ I2NP messages are fragmented into 1KB tunnel messages. Larger datagrams have exp
 Multiple application protocols can share a single I2CP session by registering handlers for specific ports:
 
 ```go
-conn.RegisterPort(8080, func(payload []byte, from i2cp.Destination) {
+conn.RegisterPort(8080, func(payload []byte, from *i2cp.Destination) {
     // Handle incoming messages on port 8080
     fmt.Printf("Received %d bytes from %s\n", len(payload), from)
 })
