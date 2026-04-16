@@ -1811,7 +1811,6 @@ func TestReadFrom_ShortBuffer(t *testing.T) {
 	// Read with small buffer
 	buf := make([]byte, 10)
 	n, addr, err := conn.ReadFrom(buf)
-
 	// Should not return error (matches net.UDPConn behavior)
 	if err != nil {
 		t.Errorf("ReadFrom() with short buffer returned error: %v", err)
