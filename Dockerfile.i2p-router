@@ -1,0 +1,17 @@
+# syntax=docker/dockerfile:1.7
+
+FROM geti2p/i2p:latest
+
+# Wrapper script that patches I2P config for cross-container network access before starting router.
+RUN cat > /start-for-compose.sh <<'EOF'
+#!/bin/sh
+set -e
+echo "[i2p-init] Patching config to listen on all interfaces..."
+find /i2p -name "*.config" -type f -exec sed -i 's/127\.0\.0\.1/0.0.0.0/g' {} +
+echo "[i2p-init] Starting I2P router..."
+exec /startapp.sh
+EOF
+RUN chmod +x /start-for-compose.sh
+
+ENTRYPOINT ["/start-for-compose.sh"]
+

@@ -170,6 +170,31 @@ Applications requiring reliability must implement it at the application layer (A
 - [I2P Datagram API Overview](https://geti2p.net/en/docs/api/datagrams)
 - [go-i2cp Documentation](https://github.com/go-i2p/go-i2cp)
 
+## Containerized Router Test
+
+This repository includes a deterministic multi-container test harness that runs the full Go test suite in one container against a dedicated Java I2P router container.
+
+- Router base image: `geti2p/i2p:latest` (same image is also published as `ghcr.io/i2p/i2p.i2p`)
+- No host ports are published by default
+- Router service: `i2p-router`
+- Test service: `router-tests`
+- Tests run after the test container confirms I2CP is reachable on `i2p-router:7654`
+
+### Run With Helper Script
+
+```bash
+./scripts/container/test-with-router.sh
+```
+
+### Run With Docker Compose
+
+```bash
+docker compose -f docker-compose.router-tests.yml build
+docker compose -f docker-compose.router-tests.yml up -d i2p-router
+docker compose -f docker-compose.router-tests.yml run --rm router-tests
+docker compose -f docker-compose.router-tests.yml down
+```
+
 ## License
 
 See [LICENSE](LICENSE) file for details.
