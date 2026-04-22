@@ -11,7 +11,7 @@ require (
 	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/go-i2p/crypto v0.1.51 // indirect
-	github.com/go-i2p/logger v0.1.5 // indirect
+	github.com/go-i2p/logger v0.1.51 // indirect
 	github.com/oklog/ulid/v2 v2.1.1 // indirect
 	github.com/samber/lo v1.53.0 // indirect
 	github.com/samber/oops v1.21.0 // indirect
