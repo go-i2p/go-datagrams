@@ -10,7 +10,7 @@ require (
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/go-i2p/crypto v0.1.60000-0.20260701134544-2e460c762111 // indirect
+	github.com/go-i2p/crypto v0.1.60000-0.20260701135847-3ade996b68a0 // indirect
 	github.com/go-i2p/logger v0.1.60000-0.20260701134448-2648c3b0e040 // indirect
 	github.com/oklog/ulid/v2 v2.1.1 // indirect
 	github.com/samber/lo v1.53.0 // indirect
