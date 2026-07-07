@@ -282,6 +282,76 @@ func buildDatagram3EnvelopeWithOptions(payload []byte, session I2CPSession, opti
 	return envelope, nil
 }
 
+// buildDatagram3Envelope constructs a Datagram3 envelope without options.
+// This is a convenience wrapper around buildDatagram3EnvelopeWithOptions.
+func buildDatagram3Envelope(payload []byte, session I2CPSession) ([]byte, error) {
+	return buildDatagram3EnvelopeWithOptions(payload, session, nil)
+}
+
+// MinDatagram3EnvelopeSize is the minimum size of a Datagram3 envelope without
+// options: fromhash(32) + flags(2) = 34 bytes.
+const MinDatagram3EnvelopeSize = 34
+
+// parseDatagram3Envelope extracts the fromhash, options, and payload from a
+// Datagram3 envelope. Datagram3 is NOT authenticated (per spec), so unlike
+// parseDatagram1Envelope/parseDatagram2Envelope there is no signature to verify.
+//
+// Format: fromhash(32) + flags(2) + [options] + payload
+//
+// This is the single, canonical Datagram3 decoder used by all DatagramConn
+// receive paths (parseEnvelope, parseEnvelopeToAddr, parseEnvelopeWithOptions),
+// so any future fix to the wire-format handling (flag validation, reserved
+// bits, options parsing) only needs to be made in one place.
+func parseDatagram3Envelope(data []byte) (payload []byte, fromHash [32]byte, options *Options, err error) {
+	if len(data) < MinDatagram3EnvelopeSize {
+		return nil, fromHash, nil, fmt.Errorf("Datagram3 envelope too short: %d bytes, need at least %d", len(data), MinDatagram3EnvelopeSize)
+	}
+
+	// Extract fromhash (first 32 bytes) - SHA-256 hash of sender's destination
+	copy(fromHash[:], data[0:32])
+
+	// Extract flags per I2P Datagram specification:
+	// Per spec: "flags :: (2 bytes) Bit order: 15 14 ... 3 2 1 0"
+	// - High byte (index 32): reserved, currently unused (bits 8-15)
+	// - Low byte (index 33): contains version (bits 0-3), options flag (bit 4), bits 5-7 reserved
+	// See: https://geti2p.net/spec/datagrams#datagram3
+	highFlags := data[32]
+	lowFlags := data[33]
+
+	// Validate reserved bits (5-15) are zero per spec:
+	// "Bits 15-5: unused, set to 0 for compatibility with future uses"
+	reservedMask := uint16(0xFFE0) // bits 5-15
+	flagsValue := uint16(highFlags)<<8 | uint16(lowFlags)
+	if flagsValue&reservedMask != 0 {
+		return nil, fromHash, nil, fmt.Errorf("Datagram3 has non-zero reserved flag bits: 0x%04x (reserved bits: 0x%04x)", flagsValue, flagsValue&reservedMask)
+	}
+
+	version := lowFlags & 0x0F
+	if version != 0x03 {
+		return nil, fromHash, nil, fmt.Errorf("invalid Datagram3 version: 0x%x (expected 0x03)", version)
+	}
+	hasOptions := (lowFlags & 0x10) != 0
+
+	// Start of payload (after fromhash + flags)
+	offset := MinDatagram3EnvelopeSize
+
+	// Parse options if present (I2P Mapping format: 2-byte size + key=value; pairs)
+	if hasOptions {
+		if len(data)-offset < 2 {
+			return nil, fromHash, nil, fmt.Errorf("Datagram3 envelope too short for options size field at offset %d: have %d bytes, need at least 2", offset, len(data)-offset)
+		}
+		opts, optLen, optErr := OptionsFromBytes(data[offset:])
+		if optErr != nil {
+			return nil, fromHash, nil, fmt.Errorf("Datagram3 failed to parse options: %w", optErr)
+		}
+		offset += optLen
+		options = opts
+	}
+
+	payload = data[offset:]
+	return payload, fromHash, options, nil
+}
+
 // parseDatagram2Flags validates and parses Datagram2 flags.
 // Returns whether options and offline signature are present.
 func parseDatagram2Flags(flags []byte) (hasOptions, hasOfflineSig bool, err error) {

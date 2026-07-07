@@ -584,22 +584,11 @@ func (d *DatagramConn) SendTo(payload []byte, destinationB64 string, port uint16
 
 	case ProtocolDatagram3:
 		// Datagram3: fromhash(32) + flags(2) + payload
-		localDest := session.Destination()
-
-		// Compute SHA-256 hash of the local destination
-		fromHash, err := destinationHash(localDest)
-		if err != nil {
-			return fmt.Errorf("failed to compute destination hash: %w", err)
+		var buildErr error
+		envelope, buildErr = buildDatagram3Envelope(payload, session)
+		if buildErr != nil {
+			return fmt.Errorf("failed to build Datagram3 envelope: %w", buildErr)
 		}
-
-		envelope = make([]byte, 32+2+len(payload))
-		copy(envelope[0:32], fromHash[:])
-
-		// flags: version 0x03 (bits 3-0), no options (bit 4 = 0)
-		envelope[32] = 0x00
-		envelope[33] = 0x03
-
-		copy(envelope[34:], payload)
 
 	case ProtocolDatagram1:
 		// Datagram1: from dest(387+) + signature(40+) + payload
@@ -981,64 +970,14 @@ func (d *DatagramConn) parseEnvelope(msg *receivedDatagram, protocol uint8) ([]b
 
 	case ProtocolDatagram3:
 		// Datagram3: fromhash(32) + flags(2) + [options] + payload
-		// See SPEC.md for format details
-		if len(msg.payload) < 34 {
-			return nil, nil, 0, fmt.Errorf("Datagram3 envelope too short: %d bytes", len(msg.payload))
-		}
-
-		// Extract fromhash (first 32 bytes) - SHA-256 hash of sender's destination
-		fromHash := msg.payload[0:32]
-
-		// Extract flags per I2P Datagram specification:
-		// Per spec: "flags :: (2 bytes) Bit order: 15 14 ... 3 2 1 0"
-		// - High byte (index 32): reserved, currently unused (bits 8-15)
-		// - Low byte (index 33): contains version (bits 0-3), options flag (bit 4), bits 5-7 reserved
-		// See: https://geti2p.net/spec/datagrams#datagram3
-		highFlags := msg.payload[32]
-		lowFlags := msg.payload[33]
-
-		// Validate reserved bits (5-15) are zero per spec:
-		// "Bits 15-5: unused, set to 0 for compatibility with future uses"
-		// High byte is entirely reserved; low byte bits 5-7 are reserved.
-		reservedMask := uint16(0xFFE0) // bits 5-15
-		flagsValue := uint16(highFlags)<<8 | uint16(lowFlags)
-		if flagsValue&reservedMask != 0 {
-			return nil, nil, 0, fmt.Errorf("Datagram3 has non-zero reserved flag bits: 0x%04x (reserved bits: 0x%04x)", flagsValue, flagsValue&reservedMask)
-		}
-
-		version := lowFlags & 0x0F
-		hasOptions := (lowFlags & 0x10) != 0
-
-		// Verify version bits (should be 0x03 for Datagram3)
-		if version != 0x03 {
-			return nil, nil, 0, fmt.Errorf("invalid Datagram3 version: 0x%x (expected 0x03)", version)
-		}
-
-		// Start of payload (after fromhash + flags)
-		offset := 34
-
-		// Parse options if present (I2P Mapping format: 2-byte size + key=value; pairs)
-		if hasOptions {
-			if len(msg.payload)-offset < 2 {
-				return nil, nil, 0, fmt.Errorf("Datagram3 envelope too short for options size field at offset %d: have %d bytes, need at least 2", offset, len(msg.payload)-offset)
-			}
-			opts, optLen, optErr := OptionsFromBytes(msg.payload[offset:])
-			if optErr != nil {
-				return nil, nil, 0, fmt.Errorf("Datagram3 failed to parse options: %w", optErr)
-			}
-			offset += optLen
-			// Options are parsed but not exposed in return value (could be added later)
-			_ = opts
-		}
-
-		// Extract payload (everything after offset)
-		payload := msg.payload[offset:]
-
+		// See SPEC.md and parseDatagram3Envelope (envelope.go) for format details.
 		// Datagram3 only provides sender's hash, not full destination.
 		// Return nil destination since no valid destination data is available.
 		// Use ReceiveFromWithAddr() to get the sender's hash via I2PAddr.DestinationHash.
-		_ = fromHash // Hash is available via ReceiveFromWithAddr()
-
+		payload, _, _, err := parseDatagram3Envelope(msg.payload)
+		if err != nil {
+			return nil, nil, 0, fmt.Errorf("failed to parse Datagram3 envelope: %w", err)
+		}
 		return payload, nil, msg.srcPort, nil
 
 	case ProtocolDatagram1:
@@ -1086,48 +1025,11 @@ func (d *DatagramConn) parseEnvelopeToAddr(msg *receivedDatagram, protocol uint8
 
 	case ProtocolDatagram3:
 		// Datagram3: fromhash(32) + flags(2) + [options] + payload
-		// See SPEC.md and https://geti2p.net/spec/datagrams#datagram3 for format details
-		if len(msg.payload) < 34 {
-			return nil, nil, fmt.Errorf("Datagram3 envelope too short: %d bytes, need at least 34", len(msg.payload))
+		// See SPEC.md and parseDatagram3Envelope (envelope.go) for format details.
+		payload, fromHash, _, err := parseDatagram3Envelope(msg.payload)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to parse Datagram3 envelope: %w", err)
 		}
-
-		// Extract fromhash (first 32 bytes) - SHA-256 hash of sender's destination
-		var fromHash [32]byte
-		copy(fromHash[:], msg.payload[0:32])
-
-		// Extract flags per I2P Datagram specification:
-		// Per spec: "flags :: (2 bytes) Bit order: 15 14 ... 3 2 1 0"
-		// - High byte (index 32): reserved, currently unused
-		// - Low byte (index 33): contains version (bits 0-3) and options flag (bit 4)
-		// See: https://geti2p.net/spec/datagrams#datagram3
-		lowFlags := msg.payload[33]
-		version := lowFlags & 0x0F
-		hasOptions := (lowFlags & 0x10) != 0
-
-		// Verify version bits (should be 0x03 for Datagram3)
-		if version != 0x03 {
-			return nil, nil, fmt.Errorf("invalid Datagram3 version: 0x%x (expected 0x03)", version)
-		}
-
-		// Start of payload (after fromhash + flags)
-		offset := 34
-
-		// Parse options if present (I2P Mapping format: 2-byte size + key=value; pairs)
-		if hasOptions {
-			if len(msg.payload)-offset < 2 {
-				return nil, nil, fmt.Errorf("Datagram3 envelope too short for options size field at offset %d: have %d bytes, need at least 2", offset, len(msg.payload)-offset)
-			}
-			opts, optLen, optErr := OptionsFromBytes(msg.payload[offset:])
-			if optErr != nil {
-				return nil, nil, fmt.Errorf("Datagram3 failed to parse options: %w", optErr)
-			}
-			offset += optLen
-			// Options are parsed but not exposed in return value (could be added later)
-			_ = opts
-		}
-
-		// Extract payload (everything after offset)
-		payload := msg.payload[offset:]
 
 		// Return I2PAddr with hash-only sender identification
 		// Datagram3 protocol only provides the hash, not the full destination
@@ -1207,47 +1109,15 @@ func (d *DatagramConn) parseEnvelopeWithOptions(msg *receivedDatagram, protocol 
 
 	case ProtocolDatagram3:
 		// Datagram3: fromhash(32) + flags(2) + [options] + payload
-		if len(msg.payload) < 34 {
-			return nil, fmt.Errorf("Datagram3 envelope too short: %d bytes, need at least 34", len(msg.payload))
+		// See parseDatagram3Envelope (envelope.go) for format details.
+		payload, fromHash, opts, err := parseDatagram3Envelope(msg.payload)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse Datagram3 envelope: %w", err)
 		}
 
-		// Extract fromhash (first 32 bytes)
-		copy(result.FromHash[:], msg.payload[0:32])
-
-		// Extract flags
-		highFlags := msg.payload[32]
-		lowFlags := msg.payload[33]
-
-		// Validate reserved bits (5-15) are zero
-		reservedMask := uint16(0xFFE0)
-		flagsValue := uint16(highFlags)<<8 | uint16(lowFlags)
-		if flagsValue&reservedMask != 0 {
-			return nil, fmt.Errorf("Datagram3 has non-zero reserved flag bits: 0x%04x", flagsValue)
-		}
-
-		version := lowFlags & 0x0F
-		hasOptions := (lowFlags & 0x10) != 0
-
-		if version != 0x03 {
-			return nil, fmt.Errorf("invalid Datagram3 version: 0x%x (expected 0x03)", version)
-		}
-
-		offset := 34
-
-		// Parse options if present
-		if hasOptions {
-			if len(msg.payload)-offset < 2 {
-				return nil, fmt.Errorf("Datagram3 envelope too short for options at offset %d", offset)
-			}
-			opts, optLen, optErr := OptionsFromBytes(msg.payload[offset:])
-			if optErr != nil {
-				return nil, fmt.Errorf("Datagram3 failed to parse options: %w", optErr)
-			}
-			offset += optLen
-			result.Options = opts
-		}
-
-		result.Payload = msg.payload[offset:]
+		result.Payload = payload
+		result.FromHash = fromHash
+		result.Options = opts
 		result.From = nil // Datagram3 only has hash, not full destination
 		result.FromAddr = &I2PAddr{
 			Destination:     "",

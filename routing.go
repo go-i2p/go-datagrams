@@ -93,20 +93,37 @@ func (d *DatagramConn) UnregisterPort(port uint16) error {
 	return nil
 }
 
-// injectMessage is a helper method for testing that injects a received datagram
-// into the receive queue. This simulates receiving a message from I2CP.
+// injectMessage delivers a received datagram into the connection's receive queue.
 //
-// In production (Phase 3), this will be called by I2CP message callbacks.
-// For now, it's used by tests to verify receive functionality.
+// This is the single production entry point used to feed real inbound I2CP
+// traffic into a DatagramConn: applications wire it up by registering a
+// [SessionDispatcher] as their I2CP session's OnMessage callback and calling
+// [SessionDispatcher.Register] for each DatagramConn that should receive
+// messages (see dispatcher.go). It is also used directly by tests to simulate
+// receiving a message without a real I2P router.
 //
-// Returns an error if the connection is closed or the queue is full.
+// Per SPEC.md "Datagram Type Identification", I2P datagram types do not share
+// a common header, so packets cannot be reliably identified by content alone.
+// To guard against misrouted or spoofed protocol numbers, injectMessage
+// rejects any message whose protocol does not match this connection's
+// configured protocol; callers (including [SessionDispatcher]) should route
+// by destination port, but this check ensures a mismatched protocol number
+// on that port is never parsed with the wrong decoder.
+//
+// Returns an error if the connection is closed, the protocol does not match,
+// or the queue is full.
 func (d *DatagramConn) injectMessage(payload []byte, from *i2cp.Destination, protocol uint8, srcPort, destPort uint16) error {
 	d.mu.RLock()
 	closed := d.closed
+	expectedProtocol := d.protocol
 	d.mu.RUnlock()
 
 	if closed {
 		return net.ErrClosed
+	}
+
+	if protocol != expectedProtocol {
+		return fmt.Errorf("dropping message on port %d: protocol %d does not match connection protocol %d", destPort, protocol, expectedProtocol)
 	}
 
 	msg := &receivedDatagram{

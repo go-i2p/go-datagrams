@@ -1,0 +1,37 @@
+name: I2P Router Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Calls the go-i2p/i2p-provider reusable workflow directly (no copied
+  # internals) to confirm each supported router backend starts up and
+  # becomes reachable in CI. See https://github.com/go-i2p/i2p-provider
+  router-smoke-test:
+    name: i2p-provider router smoke test (${{ matrix.backend }})
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [java, i2pd, go-i2p]
+    uses: go-i2p/i2p-provider/.github/workflows/i2p-router.yml@main
+    with:
+      backend: ${{ matrix.backend }}
+
+  # Runs the actual Go test suite against a dedicated I2P router using the
+  # repository's own Docker Compose harness (see README.md).
+  router-tests:
+    name: Run test suite against I2P router
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run Go test suite against I2P router
+        run: ./scripts/container/test-with-router.sh
