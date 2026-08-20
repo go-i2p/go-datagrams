@@ -17,6 +17,7 @@ jobs:
         backend:
           - java
           - i2pd
+          - go-i2p
     runs-on: ubuntu-latest
     container:
       image: ubuntu:24.04
