@@ -899,9 +899,10 @@ func TestReceiveFrom_Datagram3(t *testing.T) {
 
 	// Construct Datagram3 envelope: fromhash(32) + flags(2) + payload
 	payload := []byte("test message")
-	destStream := i2cp.NewStream(nil)
-	fromDest.WriteToStream(destStream)
-	fromHash := sha256.Sum256(destStream.Bytes())
+	fromHash, err := destinationHash(fromDest)
+	if err != nil {
+		t.Fatalf("destinationHash() failed: %v", err)
+	}
 
 	envelope := make([]byte, 32+2+len(payload))
 	copy(envelope[0:32], fromHash[:])
@@ -1046,13 +1047,12 @@ func TestReceiveFrom_Datagram1MalformedEnvelope(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// Create a test destination
-	crypto := i2cp.NewCrypto()
-	fromDest, _ := i2cp.NewDestination(crypto)
-
-	// Inject envelope too short (less than minSize of 391+64=455 bytes)
+	// Inject envelope too short (less than minSize of 391+64=455 bytes).
+	// No sender is provided: over a real I2CP session a sender destination only
+	// accompanies datagrams the I2CP layer could dissect, so a malformed
+	// envelope arrives without one.
 	shortEnvelope := make([]byte, 100)
-	err = conn.injectMessage(shortEnvelope, fromDest, ProtocolDatagram1, 9090, 8080)
+	err = conn.injectMessage(shortEnvelope, nil, ProtocolDatagram1, 9090, 8080)
 	if err != nil {
 		t.Fatalf("injectMessage() failed: %v", err)
 	}
@@ -1250,13 +1250,11 @@ func TestDatagram2Envelope_Roundtrip(t *testing.T) {
 	session := newMockSession()
 
 	// Compute target destination hash from session's own destination (self-send scenario)
-	// Uses WriteToStream for canonical serialization, matching the implementation
 	localDest := session.Destination()
-	destStream := i2cp.NewStream(nil)
-	if err := localDest.WriteToStream(destStream); err != nil {
-		t.Fatalf("WriteToStream() failed: %v", err)
+	targetHash, err := destinationHash(localDest)
+	if err != nil {
+		t.Fatalf("destinationHash() failed: %v", err)
 	}
-	targetHash := sha256.Sum256(destStream.Bytes())
 
 	testCases := []struct {
 		name    string
@@ -1307,13 +1305,11 @@ func TestDatagram2Envelope_RoundtripWithOptions(t *testing.T) {
 	session := newMockSession()
 
 	// Compute target destination hash
-	// Uses WriteToStream for canonical serialization, matching the implementation
 	localDest := session.Destination()
-	destStream := i2cp.NewStream(nil)
-	if err := localDest.WriteToStream(destStream); err != nil {
-		t.Fatalf("WriteToStream() failed: %v", err)
+	targetHash, err := destinationHash(localDest)
+	if err != nil {
+		t.Fatalf("destinationHash() failed: %v", err)
 	}
-	targetHash := sha256.Sum256(destStream.Bytes())
 
 	// Create options
 	options := NewOptions(map[string]string{
@@ -1353,14 +1349,12 @@ func TestDatagram2Envelope_ReplayPrevention(t *testing.T) {
 	session := newMockSession()
 
 	// Create a different target destination (simulating sending to someone else)
-	// Uses WriteToStream for canonical hash computation, matching the implementation
 	crypto := i2cp.NewCrypto()
 	otherDest, _ := i2cp.NewDestination(crypto)
-	otherStream := i2cp.NewStream(nil)
-	if err := otherDest.WriteToStream(otherStream); err != nil {
-		t.Fatalf("WriteToStream() failed: %v", err)
+	otherHash, err := destinationHash(otherDest)
+	if err != nil {
+		t.Fatalf("destinationHash() failed: %v", err)
 	}
-	otherHash := sha256.Sum256(otherStream.Bytes())
 
 	payload := []byte("replay test")
 
@@ -1388,13 +1382,11 @@ func TestDatagram2Envelope_ReservedFlagBits(t *testing.T) {
 	session := newMockSession()
 
 	// Compute target destination hash from session's own destination
-	// Uses WriteToStream for canonical hash computation, matching the implementation
 	localDest := session.Destination()
-	hashStream := i2cp.NewStream(nil)
-	if err := localDest.WriteToStream(hashStream); err != nil {
-		t.Fatalf("WriteToStream() failed: %v", err)
+	targetHash, err := destinationHash(localDest)
+	if err != nil {
+		t.Fatalf("destinationHash() failed: %v", err)
 	}
-	targetHash := sha256.Sum256(hashStream.Bytes())
 
 	// Build a valid Datagram2 envelope first
 	payload := []byte("test payload")
@@ -1570,9 +1562,10 @@ func TestDatagram3Envelope_Roundtrip(t *testing.T) {
 
 	// Verify hash is correct (matches our local destination)
 	localDest := session.Destination()
-	localStream := i2cp.NewStream(nil)
-	localDest.WriteToStream(localStream)
-	expectedHash := sha256.Sum256(localStream.Bytes())
+	expectedHash, err := destinationHash(localDest)
+	if err != nil {
+		t.Fatalf("destinationHash() failed: %v", err)
+	}
 
 	var gotHash [32]byte
 	copy(gotHash[:], sentEnvelope[0:32])
@@ -1608,13 +1601,11 @@ func TestEnvelope_MaxPayloadSize(t *testing.T) {
 			maxPayload: MaxI2NPSize - MinDatagram2Overhead,
 			overhead:   MinDatagram2Overhead,
 			buildEnvelope: func(payload []byte) ([]byte, error) {
-				// Uses WriteToStream for canonical hash computation, matching the implementation
 				localDest := session.Destination()
-				destStream := i2cp.NewStream(nil)
-				if err := localDest.WriteToStream(destStream); err != nil {
+				targetHash, err := destinationHash(localDest)
+				if err != nil {
 					return nil, err
 				}
-				targetHash := sha256.Sum256(destStream.Bytes())
 				return buildDatagram2Envelope(payload, session, targetHash)
 			},
 		},
@@ -1742,9 +1733,10 @@ func TestReadFrom_Datagram3(t *testing.T) {
 	testPayload := []byte("Hello, Datagram3!")
 
 	// Compute fromhash
-	destStream := i2cp.NewStream(nil)
-	fromDest.WriteToStream(destStream)
-	fromHash := sha256.Sum256(destStream.Bytes())
+	fromHash, err := destinationHash(fromDest)
+	if err != nil {
+		t.Fatalf("destinationHash() failed: %v", err)
+	}
 
 	// Build envelope
 	envelope := make([]byte, 32+2+len(testPayload))
@@ -3062,9 +3054,10 @@ func TestReceiveFromWithAddr_Datagram3(t *testing.T) {
 
 	// Construct Datagram3 envelope: fromhash(32) + flags(2) + payload
 	payload := []byte("test message")
-	destStream := i2cp.NewStream(nil)
-	fromDest.WriteToStream(destStream)
-	fromHash := sha256.Sum256(destStream.Bytes())
+	fromHash, err := destinationHash(fromDest)
+	if err != nil {
+		t.Fatalf("destinationHash() failed: %v", err)
+	}
 
 	envelope := make([]byte, 32+2+len(payload))
 	copy(envelope[0:32], fromHash[:])
@@ -3134,9 +3127,10 @@ func TestReceiveFromWithAddr_Datagram3_WithOptions(t *testing.T) {
 	fromDest, _ := i2cp.NewDestination(crypto)
 
 	// Compute hash
-	destStream := i2cp.NewStream(nil)
-	fromDest.WriteToStream(destStream)
-	fromHash := sha256.Sum256(destStream.Bytes())
+	fromHash, err := destinationHash(fromDest)
+	if err != nil {
+		t.Fatalf("destinationHash() failed: %v", err)
+	}
 
 	// Create options (empty options with 2-byte size = 0)
 	options := []byte{0x00, 0x00} // size = 0
@@ -3765,11 +3759,10 @@ func TestReceiveFromWithAddr_Datagram2(t *testing.T) {
 
 	// Compute target destination hash (self-send scenario)
 	localDest := session.Destination()
-	destStream := i2cp.NewStream(nil)
-	if err := localDest.WriteToStream(destStream); err != nil {
-		t.Fatalf("WriteToStream() failed: %v", err)
+	targetHash, err := destinationHash(localDest)
+	if err != nil {
+		t.Fatalf("destinationHash() failed: %v", err)
 	}
-	targetHash := sha256.Sum256(destStream.Bytes())
 
 	// Build a valid Datagram2 envelope
 	envelope, err := buildDatagram2Envelope(payload, session, targetHash)
@@ -3912,11 +3905,10 @@ func TestReceiveFromWithOptions_Datagram2(t *testing.T) {
 
 	// Compute target hash (self-send)
 	localDest := session.Destination()
-	destStream := i2cp.NewStream(nil)
-	if err := localDest.WriteToStream(destStream); err != nil {
-		t.Fatalf("WriteToStream() failed: %v", err)
+	targetHash, err := destinationHash(localDest)
+	if err != nil {
+		t.Fatalf("destinationHash() failed: %v", err)
 	}
-	targetHash := sha256.Sum256(destStream.Bytes())
 
 	// Build Datagram2 without options
 	envelope, err := buildDatagram2Envelope(payload, session, targetHash)
@@ -3961,11 +3953,10 @@ func TestReceiveFromWithOptions_Datagram2_WithOptions(t *testing.T) {
 
 	// Compute target hash (self-send)
 	localDest := session.Destination()
-	destStream := i2cp.NewStream(nil)
-	if err := localDest.WriteToStream(destStream); err != nil {
-		t.Fatalf("WriteToStream() failed: %v", err)
+	targetHash, err := destinationHash(localDest)
+	if err != nil {
+		t.Fatalf("destinationHash() failed: %v", err)
 	}
-	targetHash := sha256.Sum256(destStream.Bytes())
 
 	// Build Datagram2 with options
 	envelope, err := buildDatagram2EnvelopeWithOptions(payload, session, targetHash, options)

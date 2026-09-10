@@ -12,7 +12,7 @@ import (
 // and populating I2PAddr.DestinationHash in receive paths.
 func destinationHash(dest *i2cp.Destination) ([32]byte, error) {
 	destStream := i2cp.NewStream(nil)
-	if err := dest.WriteToStream(destStream); err != nil {
+	if err := dest.WriteToMessage(destStream); err != nil {
 		return [32]byte{}, fmt.Errorf("failed to serialize destination for hash: %w", err)
 	}
 	return sha256.Sum256(destStream.Bytes()), nil
@@ -114,6 +114,20 @@ func parseDatagram1Envelope(data []byte, session I2CPSession) (payload []byte, f
 	}
 
 	return payload, from, nil
+}
+
+// isDatagram1Envelope reports whether data begins with a parseable destination,
+// i.e. whether it still has Datagram1 envelope form. This distinguishes a genuine
+// envelope (where parse/signature errors must be reported) from a payload that an
+// I2CP implementation already dissected before delivery.
+func isDatagram1Envelope(data []byte) bool {
+	if len(data) < MinDatagram1Overhead {
+		return false
+	}
+	crypto := i2cp.NewCrypto()
+	stream := i2cp.NewStream(data)
+	_, err := i2cp.NewDestinationFromMessage(stream, crypto)
+	return err == nil
 }
 
 // buildDatagram2Envelope constructs a Datagram2 envelope with signature and replay prevention.

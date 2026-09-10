@@ -1,0 +1,40 @@
+name: CI (Prebuilt I2P Router Workflow)
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+# uses github.com/go-i2p/i2p-provider
+jobs:
+  test:
+    name: go-datagrams test suite (${{ matrix.backend }})
+    strategy:
+      fail-fast: false
+      matrix:
+        backend:
+          - java
+          - i2pd
+          - go-i2p
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:24.04
+      options: --init
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: go-i2p/i2p-provider/.github/actions/i2p-router@main
+        with:
+          backend: ${{ matrix.backend }}
+
+      - name: Run go-datagrams test suite
+        run: go test -v -timeout 20m -count=1 ./...
+
+      - uses: go-i2p/i2p-provider/.github/actions/i2p-router-stop@main
+        if: always()

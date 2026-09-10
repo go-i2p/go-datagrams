@@ -961,6 +961,28 @@ func (d *DatagramConn) ReceiveFromWithOptions() (*ReceiveResult, error) {
 	}
 }
 
+// parseDatagram1Receive parses a received Datagram1 message, tolerating I2CP
+// implementations that dissect the envelope before delivery.
+// Behavior:
+//   - Full envelope present: parse and verify the signature (normal path).
+//   - Payload is not an envelope and the I2CP layer provided a sender: return
+//     the payload and sender as-is. The sender is parsed but NOT authenticated
+//     by this layer, because the I2CP layer discarded the signature.
+//   - Payload is not an envelope and no sender was provided: malformed datagram,
+//     return the parse error.
+//   - Payload IS an envelope but verification failed: always an error, even if
+//     a sender was provided - a bad signature must never be silently accepted.
+func parseDatagram1Receive(msg *receivedDatagram, session I2CPSession) ([]byte, *i2cp.Destination, error) {
+	payload, from, err := parseDatagram1Envelope(msg.payload, session)
+	if err == nil {
+		return payload, from, nil
+	}
+	if msg.from == nil || isDatagram1Envelope(msg.payload) {
+		return nil, nil, fmt.Errorf("failed to parse Datagram1 envelope: %w", err)
+	}
+	return msg.payload, msg.from, nil
+}
+
 // parseEnvelope extracts the payload and sender information from a protocol-specific envelope.
 func (d *DatagramConn) parseEnvelope(msg *receivedDatagram, protocol uint8) ([]byte, *i2cp.Destination, uint16, error) {
 	switch protocol {
@@ -982,9 +1004,9 @@ func (d *DatagramConn) parseEnvelope(msg *receivedDatagram, protocol uint8) ([]b
 
 	case ProtocolDatagram1:
 		// Datagram1: from dest(387+) + signature(40+) + payload
-		payload, from, err := parseDatagram1Envelope(msg.payload, d.session)
+		payload, from, err := parseDatagram1Receive(msg, d.session)
 		if err != nil {
-			return nil, nil, 0, fmt.Errorf("failed to parse Datagram1 envelope: %w", err)
+			return nil, nil, 0, err
 		}
 		return payload, from, msg.srcPort, nil
 
@@ -1044,9 +1066,9 @@ func (d *DatagramConn) parseEnvelopeToAddr(msg *receivedDatagram, protocol uint8
 
 	case ProtocolDatagram1:
 		// Datagram1: from dest(387+) + signature(40+) + payload
-		payload, from, err := parseDatagram1Envelope(msg.payload, d.session)
+		payload, from, err := parseDatagram1Receive(msg, d.session)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to parse Datagram1 envelope: %w", err)
+			return nil, nil, err
 		}
 
 		addr := &I2PAddr{
@@ -1128,9 +1150,9 @@ func (d *DatagramConn) parseEnvelopeWithOptions(msg *receivedDatagram, protocol 
 
 	case ProtocolDatagram1:
 		// Datagram1 doesn't support options
-		payload, from, err := parseDatagram1Envelope(msg.payload, d.session)
+		payload, from, err := parseDatagram1Receive(msg, d.session)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse Datagram1 envelope: %w", err)
+			return nil, err
 		}
 		result.Payload = payload
 		result.From = from
