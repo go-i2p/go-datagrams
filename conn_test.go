@@ -996,7 +996,7 @@ func TestReceiveFrom_Datagram3MalformedEnvelope(t *testing.T) {
 		t.Error("ReceiveFrom() with malformed envelope should return error")
 	}
 
-	if err != nil && err.Error()[:9] != "Datagram3" {
+	if err != nil && !strings.Contains(err.Error(), "Datagram3 envelope too short") {
 		t.Errorf("unexpected error message: %v", err)
 	}
 }
@@ -1032,7 +1032,7 @@ func TestReceiveFrom_Datagram3InvalidVersion(t *testing.T) {
 		t.Error("ReceiveFrom() with invalid version should return error")
 	}
 
-	if err != nil && err.Error()[:7] != "invalid" {
+	if err != nil && !strings.Contains(err.Error(), "invalid Datagram3 version") {
 		t.Errorf("unexpected error message: %v", err)
 	}
 }
